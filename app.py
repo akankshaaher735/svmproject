@@ -62,9 +62,9 @@ OUTCOME_CAPTION = "Predicted outcome for this profile"
 #     for c in ["Gender", "Region", "Occupation"]:
 #         print(c, dict(enumerate(sorted(df[c].dropna().astype(str).unique()))))
 CATEGORY_LABELS = {
-    "Gender": {},
-    "Region": {},
-    "Occupation": {},
+    "Gender": {0: "Female", 1: "Male"},     # alphabetical numbering (Female=0, Male=1), the usual encoder default
+    "Region": {},                            # e.g. {0: "First name", 1: "Second name"}
+    "Occupation": {},                        # e.g. {0: "...", 1: "...", 2: "...", 3: "..."}
 }
 CATEGORICAL_COLUMNS = ["Gender", "Region", "Occupation"]
 
@@ -145,7 +145,9 @@ def build_fields():
 
 
 FIELDS = build_fields()
-LABELS_MISSING = any(not o["named"] for f in FIELDS if f["kind"] == "category" for o in f["options"])
+MISSING_NAMES = [f["label"] for f in FIELDS
+                 if f["kind"] == "category" and any(not o["named"] for o in f["options"])]
+LABELS_MISSING = bool(MISSING_NAMES)
 
 # ============================================================================
 # 5. ROUTES
@@ -162,7 +164,7 @@ def index():
         "classes": CLASSES,
         "hasProba": HAS_PROBA,
         "hasScore": HAS_SCORE,
-        "labelsMissing": LABELS_MISSING,
+        "labelsMissing": MISSING_NAMES,
         "modelOk": model is not None,
     }
     return render_template_string(PAGE, cfg=cfg, page_title=PAGE_TITLE,
@@ -624,7 +626,7 @@ footer b{color:var(--ink)}
           <div class="card-head"><h3><span data-i="sliders"></span>Profile details</h3><span class="muted" id="countLabel"></span></div>
           <div class="notice" id="notice" hidden>
             <span data-i="info"></span>
-            <span><b>Category names not set yet.</b> Gender, Region and Occupation show the numeric codes the model was trained with. Add your real names to <code>CATEGORY_LABELS</code> in <code>app.py</code> to show them here.</span>
+            <span><b>Category names not set yet.</b> <span id="noticeFields"></span> still show the numeric codes the model was trained with. Add the real names to <code>CATEGORY_LABELS</code> in <code>app.py</code> to show them here.</span>
             <button type="button" id="noticeClose" aria-label="Dismiss">&times;</button>
           </div>
           <div class="progress"><div class="progress-top"><span>Profile completion</span><b id="progText">0%</b></div><div class="progress-bar"><i id="progBar"></i></div></div>
@@ -792,7 +794,10 @@ groups.forEach((g) => {
 const control = (name) => form.elements[name];
 $("countLabel").textContent = fields.length + " inputs";
 $("chipInputs").textContent = fields.length + " inputs";
-if (labelsMissing) $("notice").hidden = false;
+if (labelsMissing.length) {
+  $("noticeFields").textContent = labelsMissing.length > 1 ? labelsMissing.slice(0, -1).join(", ") + " and " + labelsMissing[labelsMissing.length - 1] : labelsMissing[0];
+  $("notice").hidden = false;
+}
 $("noticeClose").addEventListener("click", () => ($("notice").hidden = true));
 
 /* ---------------- completion progress ---------------- */
