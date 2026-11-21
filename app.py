@@ -1,708 +1,1153 @@
-import csv
-import io
+"""
+ProfileIQ - Profile Outcome Predictor
+=====================================
+A single-file Flask web app. Backend, HTML, CSS and JavaScript all live in this
+one app.py (the page is served with render_template_string).
+
+Project folder (all three files in the ROOT of your GitHub repo):
+    app.py
+    requirements.txt
+    svm.pkl
+
+Local run : python app.py
+Render    : gunicorn app:app      (Build: pip install -r requirements.txt)
+
+What was found by inspecting svm.pkl (nothing was retrained or changed):
+  * Model type      : scikit-learn SVC (RBF kernel, C=1.0), saved with scikit-learn 1.6.1
+  * Input features  : Age, Gender, Region, Occupation, Income   (this exact order)
+  * Output classes  : 'no' and 'yes'
+  * Preprocessing   : none stored inside the pickle - the model takes raw numbers
+  * Probabilities   : NOT available (the model was saved with probability=False),
+                      so the app shows the model's decision score instead of a
+                      made-up confidence percentage.
+  * Gender / Region / Occupation are stored as numeric codes. The pickle does not
+    contain the names behind those codes, so the dropdowns show the codes until you
+    add the real names in CATEGORY_LABELS below.
+"""
+import logging
+import math
 import os
 import pickle
-from datetime import datetime
-from pathlib import Path
-from typing import Any
+import warnings
 
 import numpy as np
-from flask import Flask, Response, jsonify, render_template_string, request
+from flask import Flask, jsonify, render_template_string, request
+from werkzeug.exceptions import HTTPException
 
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("profileiq")
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+MODEL_PATH = os.path.join(BASE_DIR, "svm.pkl")
+
+# ============================================================================
+# 1. BRANDING  (edit these to match what your yes / no target really means)
+# ============================================================================
+APP_NAME = "ProfileIQ"
+APP_TAGLINE = "Smart profile-based outcome prediction"
+PAGE_TITLE = "ProfileIQ | Profile Outcome Predictor"
+OUTCOME_CAPTION = "Predicted outcome for this profile"
+
+# ============================================================================
+# 2. CATEGORY NAMES  <-- fill these in with your real names
+# ============================================================================
+# The model only understands numbers. Put the real name for each code here, the
+# same way you encoded the data before training. Example format:
+#     "Gender": {0: "Name for code 0", 1: "Name for code 1"}
+# Leave a field as {} and the dropdown simply shows "Code 0", "Code 1", ...
+#
+# To print your real mapping, run this once in your notebook
+# (df = your ORIGINAL dataframe before encoding; assumes LabelEncoder's
+# alphabetical numbering):
+#     for c in ["Gender", "Region", "Occupation"]:
+#         print(c, dict(enumerate(sorted(df[c].dropna().astype(str).unique()))))
+CATEGORY_LABELS = {
+    "Gender": {},
+    "Region": {},
+    "Occupation": {},
+}
+CATEGORICAL_COLUMNS = ["Gender", "Region", "Occupation"]
+
+# Optional: force the list of valid codes. Leave as None to read them from the
+# model itself (the values that appear in its stored support vectors).
+CATEGORY_CODES = {"Gender": None, "Region": None, "Occupation": None}
+
+# ============================================================================
+# 3. LOAD THE MODEL (the site still opens if something is wrong with the file)
+# ============================================================================
+FALLBACK_FEATURES = ["Age", "Gender", "Region", "Occupation", "Income"]
+
+model, MODEL_ERROR = None, None
+try:
+    try:
+        with open(MODEL_PATH, "rb") as f:
+            model = pickle.load(f)
+    except Exception:
+        import joblib  # used only if the file was saved with joblib
+        model = joblib.load(MODEL_PATH)
+except Exception as exc:  # noqa: BLE001
+    MODEL_ERROR = f"{type(exc).__name__}: {exc}"
+    log.error("Could not load svm.pkl -> %s", MODEL_ERROR)
+
+FEATURES = list(getattr(model, "feature_names_in_", FALLBACK_FEATURES))   # exact training order
+CLASSES = [str(c) for c in getattr(model, "classes_", ["no", "yes"])]
+HAS_PROBA = model is not None and hasattr(model, "predict_proba")          # False for this model
+HAS_SCORE = model is not None and hasattr(model, "decision_function")
+
+
+# ============================================================================
+# 4. FORM FIELDS
+# ============================================================================
+def category_codes(name):
+    """Valid numeric codes for a categorical column."""
+    if CATEGORY_CODES.get(name):
+        return sorted(int(c) for c in CATEGORY_CODES[name])
+    sv = getattr(model, "support_vectors_", None)
+    if sv is not None and name in FEATURES:
+        col = sv[:, FEATURES.index(name)]
+        return sorted(int(c) for c in np.unique(col))
+    return [0, 1]
+
+
+FIELD_META = {
+    "Age":        dict(label="Age",        hint="Age of the person, in years",                  icon="user",      group="Personal details",  min=1, max=120, step=1, integer=True, placeholder="Enter age"),
+    "Gender":     dict(label="Gender",     hint="Select the gender category",                   icon="users",     group="Personal details"),
+    "Region":     dict(label="Region",     hint="Select the region category",                   icon="pin",       group="Location & work"),
+    "Occupation": dict(label="Occupation", hint="Select the occupation category",               icon="briefcase", group="Location & work"),
+    "Income":     dict(label="Income",     hint="Income value, in the same units as your data", icon="cash",      group="Financial",         min=0, max=1_000_000_000, step=1, placeholder="Enter income", wide=True),
+}
+
+
+def build_fields():
+    fields = []
+    for name in FEATURES:
+        meta = dict(FIELD_META.get(name, {}))
+        meta.setdefault("label", name.replace("_", " "))
+        meta.setdefault("hint", name)
+        meta.setdefault("icon", "dot")
+        meta.setdefault("group", "Other details")
+        meta["name"] = name
+        if name in CATEGORICAL_COLUMNS:
+            labels = CATEGORY_LABELS.get(name, {})
+            meta["kind"] = "category"
+            meta["options"] = [
+                {"code": c, "label": str(labels.get(c, f"Code {c}")), "named": c in labels}
+                for c in category_codes(name)
+            ]
+        else:
+            meta["kind"] = "number"
+            meta.setdefault("min", -1e12)
+            meta.setdefault("max", 1e12)
+            meta.setdefault("step", "any")
+            meta.setdefault("placeholder", "Enter value")
+        fields.append(meta)
+    return fields
+
+
+FIELDS = build_fields()
+LABELS_MISSING = any(not o["named"] for f in FIELDS if f["kind"] == "category" for o in f["options"])
+
+# ============================================================================
+# 5. ROUTES
+# ============================================================================
 app = Flask(__name__)
 
-BASE_DIR = Path(__file__).resolve().parent
-MODEL_PATH = BASE_DIR / "svm.pkl"
 
-EXPECTED_FEATURES = [
-    "Age",
-    "Gender",
-    "Region",
-    "Occupation",
-    "Income",
-]
-
-FEATURE_DESCRIPTIONS = {
-    "Age": "Applicant age (numeric)",
-    "Gender": "Applicant gender category",
-    "Region": "Applicant region category",
-    "Occupation": "Applicant occupation category",
-    "Income": "Applicant income (numeric)",
-}
-
-CATEGORICAL_OPTIONS = {
-    "Gender": [
-        {"label": "Category 0 (Female / Group A)", "value": 0},
-        {"label": "Category 1 (Male / Group B)", "value": 1},
-    ],
-    "Region": [
-        {"label": "Region 0 (North)", "value": 0},
-        {"label": "Region 1 (South)", "value": 1},
-        {"label": "Region 2 (East)", "value": 2},
-        {"label": "Region 3 (West)", "value": 3},
-    ],
-    "Occupation": [
-        {"label": "Occupation 0 (Salaried)", "value": 0},
-        {"label": "Occupation 1 (Self-Employed)", "value": 1},
-        {"label": "Occupation 2 (Student)", "value": 2},
-        {"label": "Occupation 3 (Other)", "value": 3},
-    ],
-}
+@app.get("/")
+def index():
+    cfg = {
+        "appName": APP_NAME,
+        "caption": OUTCOME_CAPTION,
+        "fields": FIELDS,
+        "classes": CLASSES,
+        "hasProba": HAS_PROBA,
+        "hasScore": HAS_SCORE,
+        "labelsMissing": LABELS_MISSING,
+        "modelOk": model is not None,
+    }
+    return render_template_string(PAGE, cfg=cfg, page_title=PAGE_TITLE,
+                                  app_name=APP_NAME, tagline=APP_TAGLINE)
 
 
-def load_model(path: Path) -> Any:
-    if not path.exists():
-        raise FileNotFoundError(f"Model file not found at: {path}")
-    with open(path, "rb") as file:
-        return pickle.load(file)
+@app.get("/health")
+def health():
+    return jsonify(status="ok" if model is not None else "model_not_loaded",
+                   model_error=MODEL_ERROR, category_names_set=not LABELS_MISSING)
 
 
-MODEL = load_model(MODEL_PATH)
-
-FEATURE_ORDER = (
-    list(MODEL.feature_names_in_)
-    if hasattr(MODEL, "feature_names_in_") and MODEL.feature_names_in_ is not None
-    else EXPECTED_FEATURES
-)
-
-CLASSES = (
-    [str(c) for c in MODEL.classes_]
-    if hasattr(MODEL, "classes_") and MODEL.classes_ is not None
-    else ["no", "yes"]
-)
-
-SUPPORTS_PROBA = bool(getattr(MODEL, "probability", False) and hasattr(MODEL, "predict_proba"))
-
-SESSION_HISTORY: list[dict[str, Any]] = []
-CLASS_COUNTS: dict[str, int] = {cls: 0 for cls in CLASSES}
+@app.get("/favicon.ico")
+def favicon():
+    return ("", 204)
 
 
-def build_feature_vector(payload: dict[str, Any]) -> np.ndarray:
-    values: list[float] = []
-    for feature in FEATURE_ORDER:
-        if feature not in payload:
-            raise ValueError(f"Missing required feature: '{feature}'.")
-        raw_val = payload[feature]
-        if raw_val is None or str(raw_val).strip() == "":
-            raise ValueError(f"Feature '{feature}' cannot be empty.")
+def validate(payload):
+    """Check each input and convert it to the number the model expects."""
+    row, errors = {}, {}
+    for f in FIELDS:
+        name, raw = f["name"], payload.get(f["name"])
+        if raw is None or str(raw).strip() == "":
+            errors[name] = "This field is required."
+            continue
+
+        if f["kind"] == "category":
+            allowed = {str(o["code"]): o["code"] for o in f["options"]}
+            if str(raw).strip() in allowed:
+                row[name] = float(allowed[str(raw).strip()])
+            else:
+                errors[name] = "Please choose one of the listed options."
+            continue
+
         try:
-            num_val = float(raw_val)
-        except (TypeError, ValueError) as exc:
-            raise ValueError(f"Feature '{feature}' must be a valid number.") from exc
-        if not np.isfinite(num_val):
-            raise ValueError(f"Feature '{feature}' must be a finite number.")
-        values.append(num_val)
-    return np.array([values], dtype=np.float64)
+            value = float(raw)
+        except (TypeError, ValueError):
+            errors[name] = "Enter a valid number."
+            continue
+        if math.isnan(value) or math.isinf(value):
+            errors[name] = "Enter a valid number."
+        elif not (f["min"] <= value <= f["max"]):
+            errors[name] = f"Enter a value between {f['min']:,.0f} and {f['max']:,.0f}."
+        elif f.get("integer") and value != int(value):
+            errors[name] = "Enter a whole number."
+        else:
+            row[name] = value
+    return row, errors
 
 
-HTML_LINES = [
-    "<!DOCTYPE html>",
-    '<html lang="en" data-theme="dark">',
-    "<head>",
-    '  <meta charset="UTF-8" />',
-    '  <meta name="viewport" content="width=device-width, initial-scale=1.0" />',
-    "  <title>MintTurquoise SVM Studio</title>",
-    '  <link rel="preconnect" href="https://fonts.googleapis.com">',
-    '  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>',
-    '  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">',
-    "  <style>",
-    "    :root {",
-    "      --mint: #98E8DE;",
-    "      --navy: #101827;",
-    "      --teal: #163A40;",
-    "      --aqua: #B8FFF3;",
-    "      --muted-mint: #6FCFC1;",
-    "      --text: #F5FAFA;",
-    "      --text-sec: #AAB8C2;",
-    "      --glass: rgba(22, 58, 64, 0.56);",
-    "      --border: rgba(152, 232, 222, 0.28);",
-    "      --input-bg: rgba(16, 24, 39, 0.78);",
-    "      --shadow: 0 20px 46px rgba(10, 15, 25, 0.65), 0 0 24px rgba(152, 232, 222, 0.14);",
-    "    }",
-    '    html[data-theme="light"] {',
-    "      --mint: #149689;",
-    "      --navy: #F5FAFA;",
-    "      --teal: #DDF6F2;",
-    "      --aqua: #0E7C72;",
-    "      --muted-mint: #24A89B;",
-    "      --text: #101827;",
-    "      --text-sec: #3B5259;",
-    "      --glass: rgba(255, 255, 255, 0.78);",
-    "      --border: rgba(20, 150, 137, 0.28);",
-    "      --input-bg: rgba(255, 255, 255, 0.94);",
-    "      --shadow: 0 16px 36px rgba(16, 24, 39, 0.1), 0 0 18px rgba(20, 150, 137, 0.12);",
-    "    }",
-    "    * { box-sizing: border-box; margin: 0; padding: 0; }",
-    "    body {",
-    '      font-family: "Inter", -apple-system, BlinkMacSystemFont, sans-serif;',
-    "      color: var(--text);",
-    "      min-height: 100vh;",
-    "      background: linear-gradient(135deg, var(--navy) 0%, var(--teal) 52%, var(--navy) 100%);",
-    "      background-size: 220% 220%;",
-    "      animation: bgFlow 18s ease infinite;",
-    "      overflow-x: hidden;",
-    "      transition: background 0.35s ease, color 0.3s ease;",
-    "    }",
-    "    @keyframes bgFlow {",
-    "      0% { background-position: 0% 50%; }",
-    "      50% { background-position: 100% 50%; }",
-    "      100% { background-position: 0% 50%; }",
-    "    }",
-    "    #particles-canvas {",
-    "      position: fixed; inset: 0; width: 100%; height: 100%;",
-    "      z-index: 0; pointer-events: none; opacity: 0.65;",
-    "    }",
-    "    .floating-shapes {",
-    "      position: fixed; inset: 0; z-index: 0; pointer-events: none; overflow: hidden;",
-    "    }",
-    "    .shape {",
-    "      position: absolute; border-radius: 999px;",
-    "      background: radial-gradient(circle, rgba(152, 232, 222, 0.16), rgba(111, 207, 193, 0.02));",
-    "      border: 1px solid rgba(184, 255, 243, 0.14);",
-    "      animation: shapeDrift 14s ease-in-out infinite;",
-    "    }",
-    "    .shape.s1 { width: 240px; height: 240px; top: 8%; left: -60px; animation-delay: 0s; }",
-    "    .shape.s2 { width: 170px; height: 170px; top: 58%; right: -40px; border-radius: 36px; animation-delay: -4s; }",
-    "    .shape.s3 { width: 120px; height: 120px; bottom: 8%; left: 18%; animation-delay: -8s; }",
-    "    @keyframes shapeDrift {",
-    "      0%, 100% { transform: translateY(0px) rotate(0deg); }",
-    "      50% { transform: translateY(-18px) rotate(8deg); }",
-    "    }",
-    "    .shell {",
-    "      position: relative; z-index: 1; max-width: 1240px;",
-    "      margin: 0 auto; padding: 20px 20px 52px;",
-    "      animation: pageIn 0.6s cubic-bezier(0.22, 1, 0.36, 1) both;",
-    "    }",
-    "    @keyframes pageIn {",
-    "      from { opacity: 0; transform: translateY(14px); }",
-    "      to { opacity: 1; transform: translateY(0); }",
-    "    }",
-    "    .top-header {",
-    "      display: flex; align-items: center; justify-content: space-between; gap: 16px;",
-    "      padding: 15px 22px; border-radius: 20px;",
-    "      background: var(--glass); backdrop-filter: blur(16px);",
-    "      border: 1px solid var(--border); box-shadow: var(--shadow); margin-bottom: 24px;",
-    "    }",
-    "    .brand { display: flex; align-items: center; gap: 12px; }",
-    "    .logo-box {",
-    "      width: 42px; height: 42px; border-radius: 13px; display: grid; place-items: center;",
-    "      background: linear-gradient(135deg, var(--mint), var(--muted-mint));",
-    "      color: #101827; box-shadow: 0 0 18px rgba(152, 232, 222, 0.45);",
-    "    }",
-    "    .app-title { font-size: 1.22rem; font-weight: 800; letter-spacing: -0.02em; color: var(--mint); }",
-    "    .tagline { font-size: 0.8rem; color: var(--text-sec); }",
-    "    .header-controls { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }",
-    "    .btn {",
-    '      font-family: "Inter", sans-serif; font-size: 0.86rem; font-weight: 600;',
-    "      padding: 10px 16px; border-radius: 12px; border: 1px solid var(--border);",
-    "      background: rgba(152, 232, 222, 0.1); color: var(--text);",
-    "      cursor: pointer; text-decoration: none; display: inline-flex; align-items: center; gap: 8px;",
-    "      transition: transform 0.2s ease, background 0.2s ease, border-color 0.2s ease, box-shadow 0.2s ease;",
-    "    }",
-    "    .btn:hover {",
-    "      transform: translateY(-2px); border-color: var(--aqua);",
-    "      background: rgba(152, 232, 222, 0.2); box-shadow: 0 0 16px rgba(152, 232, 222, 0.25);",
-    "    }",
-    "    .btn:active { transform: translateY(0) scale(0.98); }",
-    "    .btn-primary {",
-    "      background: linear-gradient(135deg, var(--mint), var(--muted-mint));",
-    "      color: #101827; border-color: var(--aqua);",
-    "      box-shadow: 0 8px 22px rgba(111, 207, 193, 0.35);",
-    "    }",
-    "    .btn-primary:hover { box-shadow: 0 12px 28px rgba(184, 255, 243, 0.45); }",
-    "    .glass-card {",
-    "      background: var(--glass); backdrop-filter: blur(16px);",
-    "      border: 1px solid var(--border); border-radius: 22px;",
-    "      padding: 24px; box-shadow: var(--shadow);",
-    "      transition: transform 0.25s ease, border-color 0.25s ease, box-shadow 0.25s ease;",
-    "    }",
-    "    .glass-card:hover {",
-    "      transform: translateY(-3px); border-color: var(--aqua);",
-    "      box-shadow: 0 22px 50px rgba(10, 15, 25, 0.72), 0 0 26px rgba(152, 232, 222, 0.2);",
-    "    }",
-    "    .welcome-box { margin-bottom: 22px; }",
-    "    .welcome-box h2 { font-size: 1.45rem; font-weight: 800; color: var(--aqua); margin-bottom: 6px; }",
-    "    .welcome-box p { font-size: 0.92rem; color: var(--text-sec); line-height: 1.55; }",
-    "    .stats-row {",
-    "      display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));",
-    "      gap: 16px; margin-bottom: 22px;",
-    "    }",
-    "    .stat-card {",
-    "      background: var(--glass); backdrop-filter: blur(16px);",
-    "      border: 1px solid var(--border); border-radius: 18px;",
-    "      padding: 18px 20px; box-shadow: var(--shadow);",
-    "    }",
-    "    .stat-label { font-size: 0.76rem; text-transform: uppercase; letter-spacing: 0.06em; color: var(--text-sec); margin-bottom: 6px; }",
-    '    .stat-val { font-size: 1.8rem; font-weight: 800; font-family: "JetBrains Mono", monospace; color: var(--mint); }',
-    "    .grid-main {",
-    "      display: grid; grid-template-columns: 1.3fr 0.9fr;",
-    "      gap: 22px; align-items: start; margin-bottom: 22px;",
-    "    }",
-    "    @media (max-width: 940px) { .grid-main { grid-template-columns: 1fr; } }",
-    "    .section-heading { font-size: 1.1rem; font-weight: 700; color: var(--mint); margin-bottom: 16px; }",
-    "    .form-grid {",
-    "      display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));",
-    "      gap: 16px; margin-bottom: 20px;",
-    "    }",
-    "    .field { display: flex; flex-direction: column; gap: 6px; }",
-    '    .field label { font-size: 0.84rem; font-weight: 600; font-family: "JetBrains Mono", monospace; color: var(--text); }',
-    "    .field small { font-size: 0.74rem; color: var(--text-sec); }",
-    "    .control {",
-    "      width: 100%; padding: 11px 13px; border-radius: 12px;",
-    "      border: 1px solid var(--border); background: var(--input-bg);",
-    '      color: var(--text); font-family: "JetBrains Mono", monospace; font-size: 0.86rem;',
-    "      outline: none; transition: border-color 0.2s ease, box-shadow 0.2s ease;",
-    "    }",
-    "    .control:focus {",
-    "      border-color: var(--aqua);",
-    "      box-shadow: 0 0 0 3px rgba(152, 232, 222, 0.24), 0 0 14px rgba(184, 255, 243, 0.25);",
-    "    }",
-    "    .btn-group { display: flex; flex-wrap: wrap; gap: 10px; }",
-    "    .result-card-glow {",
-    "      border: 1px solid var(--mint);",
-    "      box-shadow: 0 18px 44px rgba(10, 15, 25, 0.7), 0 0 28px rgba(152, 232, 222, 0.28);",
-    "      min-height: 320px;",
-    "    }",
-    "    .result-panel { transition: opacity 0.3s ease, transform 0.3s ease; }",
-    "    .result-badge {",
-    "      display: inline-block; padding: 8px 16px; border-radius: 999px;",
-    "      background: rgba(152, 232, 222, 0.16); border: 1px solid var(--aqua);",
-    '      color: var(--aqua); font-weight: 800; font-size: 1.05rem; font-family: "JetBrains Mono", monospace;',
-    "      box-shadow: 0 0 18px rgba(152, 232, 222, 0.3); margin-bottom: 14px;",
-    "    }",
-    "    .meta-line { font-size: 0.86rem; color: var(--text-sec); margin-bottom: 14px; }",
-    "    .bar-wrap { margin-bottom: 12px; }",
-    '    .bar-head { display: flex; justify-content: space-between; font-size: 0.8rem; font-family: "JetBrains Mono", monospace; margin-bottom: 5px; }',
-    "    .bar-track { height: 10px; border-radius: 999px; background: rgba(152, 232, 222, 0.15); overflow: hidden; }",
-    "    .bar-fill {",
-    "      height: 100%; width: 0%; border-radius: 999px;",
-    "      background: linear-gradient(90deg, var(--muted-mint), var(--aqua));",
-    "      transition: width 0.65s cubic-bezier(0.22, 1, 0.36, 1);",
-    "    }",
-    "    .error-banner {",
-    "      display: none; margin-top: 12px; padding: 11px 14px; border-radius: 12px;",
-    "      background: rgba(244, 63, 94, 0.16); border: 1px solid rgba(251, 113, 133, 0.45);",
-    "      color: #fecdd3; font-size: 0.84rem; font-weight: 500;",
-    "    }",
-    '    html[data-theme="light"] .error-banner { color: #9f1239; }',
-    "    .error-banner.show { display: block; }",
-    "    .loading-veil {",
-    "      position: fixed; inset: 0; z-index: 50; display: none;",
-    "      align-items: center; justify-content: center; flex-direction: column; gap: 14px;",
-    "      background: rgba(16, 24, 39, 0.72); backdrop-filter: blur(8px);",
-    "    }",
-    "    .loading-veil.show { display: flex; }",
-    "    .spinner-ring {",
-    "      width: 54px; height: 54px; border-radius: 50%;",
-    "      border: 4px solid rgba(152, 232, 222, 0.22);",
-    "      border-top-color: var(--aqua);",
-    "      animation: spin 0.9s linear infinite;",
-    "      box-shadow: 0 0 20px rgba(152, 232, 222, 0.35);",
-    "    }",
-    "@keyframes spin { to { transform: rotate(360deg); } }",
-    "    .table-box { overflow-x: auto; border-radius: 14px; border: 1px solid var(--border); background: var(--input-bg); }",
-    "    table { width: 100%; border-collapse: collapse; font-size: 0.82rem; }",
-    '    th, td { padding: 11px 14px; text-align: left; border-bottom: 1px solid rgba(152, 232, 222, 0.12); font-family: "JetBrains Mono", monospace; }',
-    "    th { font-size: 0.74rem; text-transform: uppercase; color: var(--mint); background: rgba(152, 232, 222, 0.08); }",
-    "    tr:last-child td { border-bottom: none; }",
-    "  </style>",
-    "</head>",
-    "<body>",
-    '  <canvas id="particles-canvas"></canvas>',
-    '  <div class="floating-shapes" aria-hidden="true">',
-    '    <div class="shape s1"></div><div class="shape s2"></div><div class="shape s3"></div>',
-    "  </div>",
-    '  <div class="loading-veil" id="loadingVeil" aria-hidden="true">',
-    '    <div class="spinner-ring"></div>',
-    '    <div style="font-weight: 600; color: var(--aqua);">Predicting with SVM...</div>',
-    "  </div>",
-    '  <div class="shell">',
-    '    <header class="top-header">',
-    '      <div class="brand">',
-    '        <div class="logo-box" aria-hidden="true">',
-    '          <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">',
-    '            <polygon points="12 2 22 8.5 22 15.5 12 22 2 15.5 2 8.5 12 2"></polygon>',
-    '            <circle cx="12" cy="12" r="3"></circle>',
-    "          </svg>",
-    "        </div>",
-    "        <div>",
-    '          <div class="app-title">MintTurquoise SVM Studio</div>',
-    '          <div class="tagline">Support Vector Machine Classification &bull; svm.pkl</div>',
-    "        </div>",
-    "      </div>",
-    '      <div class="header-controls">',
-    '        <button type="button" class="btn" id="modeBtn">Mode: Category</button>',
-    '        <button type="button" class="btn" id="themeBtn"><span id="themeIcon">☀️</span><span id="themeText">Light</span></button>',
-    "      </div>",
-    "    </header>",
-    '    <section class="glass-card welcome-box">',
-    "      <h2>Welcome to Your SVM Inference Dashboard</h2>",
-    "      <p>Run real-time predictions using your trained <strong>SVC</strong> model (<code>svm.pkl</code>) across the 5 exact features (<code>Age</code>, <code>Gender</code>, <code>Region</code>, <code>Occupation</code>, <code>Income</code>) with session analytics and CSV export.</p>",
-    "    </section>",
-    '    <section class="stats-row">',
-    '      <div class="stat-card">',
-    '        <div class="stat-label">Total Predictions</div>',
-    '        <div class="stat-val" id="totalStat">{{ total_predictions }}</div>',
-    "      </div>",
-    "      {% for cls, cnt in class_counts.items() %}",
-    '      <div class="stat-card">',
-    '        <div class="stat-label">Class "{{ cls }}" Count</div>',
-    '        <div class="stat-val cls-stat" data-cls="{{ cls }}">{{ cnt }}</div>',
-    "      </div>",
-    "      {% endfor %}",
-    "    </section>",
-    '    <div class="grid-main">',
-    '      <section class="glass-card">',
-    '        <div class="section-heading">Model Input Form</div>',
-    '        <form id="svmForm" novalidate>',
-    '          <div class="form-grid">',
-    "            {% for feat in features %}",
-    "            {% set opts = categorical_options.get(feat) %}",
-    '            <div class="field">',
-    '              <label for="{{ feat }}">{{ loop.index }}. {{ feat }}</label>',
-    "              {% if opts %}",
-    '              <select class="control" id="{{ feat }}" name="{{ feat }}">',
-    '                <option value="">Select {{ feat }}</option>',
-    "                {% for o in opts %}",
-    '                <option value="{{ o.value }}">{{ o.label }}</option>',
-    "                {% endfor %}",
-    "              </select>",
-    '              <input class="control" type="number" step="any" id="{{ feat }}_num" placeholder="Numeric code" style="display:none;" />',
-    "              {% else %}",
-    '              <input class="control" type="number" step="any" id="{{ feat }}" name="{{ feat }}" placeholder="Enter {{ feat }}" required />',
-    "              {% endif %}",
-    "              <small>{{ descriptions.get(feat, \"Numeric input\") }}</small>",
-    "            </div>",
-    "            {% endfor %}",
-    "          </div>",
-    '          <div class="btn-group">',
-    '            <button type="submit" class="btn btn-primary">Predict Class</button>',
-    '            <button type="button" class="btn" id="resetBtn">Reset</button>',
-    "          </div>",
-    '          <div class="error-banner" id="errorBanner" role="alert"></div>',
-    "        </form>",
-    "      </section>",
-    '      <aside class="glass-card result-card-glow">',
-    '        <div class="section-heading">Prediction Result</div>',
-    '        <div class="result-panel" id="resultPanel">',
-    '          <div id="emptyResult" style="color: var(--text-sec); font-size: 0.88rem; padding: 28px 0;">',
-    "            Submit valid feature values to inspect the predicted SVM class.",
-    "          </div>",
-    '          <div id="activeResult" style="display: none;">',
-    '            <div class="result-badge" id="predBadge">Predicted: —</div>',
-    '            <div class="meta-line" id="confLine">Confidence: Not available (SVC probability=False)</div>',
-    '            <div id="probBars"></div>',
-    "          </div>",
-    "        </div>",
-    "      </aside>",
-    "    </div>",
-    '    <section class="glass-card">',
-    '      <div style="display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 12px; margin-bottom: 14px;">',
-    '        <div class="section-heading" style="margin-bottom: 0;">Session Prediction History</div>',
-    '        <div class="btn-group">',
-    '          <a href="/download-csv" class="btn">Download CSV</a>',
-    '          <button type="button" class="btn" id="clearHistoryBtn">Clear History</button>',
-    "        </div>",
-    "      </div>",
-    '      <div class="table-box">',
-    "        <table>",
-    "          <thead><tr><th>Time</th><th>Prediction</th><th>Confidence</th><th>Features</th></tr></thead>",
-    '          <tbody id="historyBody">',
-    "            {% if history %}",
-    "              {% for item in history|reverse %}",
-    "              <tr>",
-    "                <td>{{ item.timestamp }}</td>",
-    "                <td>{{ item.prediction }}</td>",
-    "                <td>{% if item.confidence is not none %}{{ \"%.2f%%\"|format(item.confidence * 100) }}{% else %}N/A{% endif %}</td>",
-    "                <td>{{ item.summary }}</td>",
-    "              </tr>",
-    "              {% endfor %}",
-    "            {% else %}",
-    '              <tr id="noHistoryRow"><td colspan="4" style="text-align: center; color: var(--text-sec); padding: 18px;">No predictions yet in this session.</td></tr>',
-    "            {% endif %}",
-    "          </tbody>",
-    "        </table>",
-    "      </div>",
-    "    </section>",
-    "  </div>",
-    "  <script>",
-    "    const FEATURE_ORDER = {{ features | tojson }};",
-    "    const CAT_KEYS = {{ cat_keys | tojson }};",
-    "    const htmlRoot = document.documentElement;",
-    "    const themeBtn = document.getElementById('themeBtn');",
-    "    const themeIcon = document.getElementById('themeIcon');",
-    "    const themeText = document.getElementById('themeText');",
-    "    function setTheme(t) {",
-    "      htmlRoot.setAttribute('data-theme', t);",
-    "      localStorage.setItem('svm_theme', t);",
-    "      themeIcon.textContent = t === 'light' ? '🌙' : '☀️';",
-    "      themeText.textContent = t === 'light' ? 'Dark' : 'Light';",
-    "    }",
-    "    setTheme(localStorage.getItem('svm_theme') || 'dark');",
-    "    themeBtn.addEventListener('click', () => {",
-    "      setTheme(htmlRoot.getAttribute('data-theme') === 'dark' ? 'light' : 'dark');",
-    "    });",
-    "    let numericMode = false;",
-    "    const modeBtn = document.getElementById('modeBtn');",
-    "    modeBtn.addEventListener('click', () => {",
-    "      numericMode = !numericMode;",
-    "      modeBtn.textContent = numericMode ? 'Mode: Numeric Code' : 'Mode: Category';",
-    "      CAT_KEYS.forEach((k) => {",
-    "        const sel = document.getElementById(k);",
-    "        const num = document.getElementById(k + '_num');",
-    "        if (!sel || !num) return;",
-    "        if (numericMode) {",
-    "          if (sel.value !== '') num.value = sel.value;",
-    "          sel.style.display = 'none';",
-    "          num.style.display = 'block';",
-    "        } else {",
-    "          if (num.value !== '') {",
-    "            const found = Array.from(sel.options).find((o) => o.value === String(Number(num.value)));",
-    "            sel.value = found ? found.value : '';",
-    "          }",
-    "          num.style.display = 'none';",
-    "          sel.style.display = 'block';",
-    "        }",
-    "      });",
-    "    });",
-    "    function animateCount(el, target) {",
-    "      const start = Number(el.textContent) || 0;",
-    "      const end = Number(target) || 0;",
-    "      if (start === end) { el.textContent = end; return; }",
-    "      const t0 = performance.now();",
-    "      function tick(now) {",
-    "        const p = Math.min((now - t0) / 400, 1);",
-    "        el.textContent = Math.round(start + (end - start) * (1 - Math.pow(1 - p, 3)));",
-    "        if (p < 1) requestAnimationFrame(tick);",
-    "      }",
-    "      requestAnimationFrame(tick);",
-    "    }",
-    "    const errorBanner = document.getElementById('errorBanner');",
-    "    function showError(msg) { errorBanner.textContent = msg; errorBanner.classList.add('show'); }",
-    "    function hideError() { errorBanner.textContent = ''; errorBanner.classList.remove('show'); }",
-    "    const loadingVeil = document.getElementById('loadingVeil');",
-    "    const svmForm = document.getElementById('svmForm');",
-    "    document.getElementById('resetBtn').addEventListener('click', () => {",
-    "      svmForm.reset();",
-    "      CAT_KEYS.forEach((k) => { const n = document.getElementById(k + '_num'); if (n) n.value = ''; });",
-    "      hideError();",
-    "    });",
-    "    function renderPrediction(res) {",
-    "      const panel = document.getElementById('resultPanel');",
-    "      panel.style.opacity = '0.3';",
-    "      panel.style.transform = 'translateY(6px)';",
-    "      setTimeout(() => {",
-    "        document.getElementById('emptyResult').style.display = 'none';",
-    "        document.getElementById('activeResult').style.display = 'block';",
-    "        document.getElementById('predBadge').textContent = 'Predicted Class: ' + res.prediction;",
-    "        const confEl = document.getElementById('confLine');",
-    "        const barsEl = document.getElementById('probBars');",
-    "        barsEl.innerHTML = '';",
-    "        if (res.confidence !== null && res.confidence !== undefined) {",
-    "          confEl.textContent = 'Confidence: ' + (res.confidence * 100).toFixed(2) + '%';",
-    "        } else {",
-    "          confEl.textContent = 'Confidence: Not available for this SVM configuration';",
-    "        }",
-    "        if (Array.isArray(res.probabilities)) {",
-    "          res.probabilities.forEach((item) => {",
-    "            const pct = (item.probability * 100).toFixed(2);",
-    "            const div = document.createElement('div');",
-    "            div.className = 'bar-wrap';",
-    "            div.innerHTML = '<div class=\"bar-head\"><span>Class ' + item.class + '</span><span>' + pct + '%</span></div>' +",
-    "              '<div class=\"bar-track\"><div class=\"bar-fill\" style=\"width:0%\"></div></div>';",
-    "            barsEl.appendChild(div);",
-    "            requestAnimationFrame(() => {",
-    "              div.querySelector('.bar-fill').style.width = Math.max(0, Math.min(100, item.probability * 100)) + '%';",
-    "            });",
-    "          });",
-    "        }",
-    "        panel.style.opacity = '1';",
-    "        panel.style.transform = 'translateY(0)';",
-    "      }, 120);",
-    "      animateCount(document.getElementById('totalStat'), res.total_predictions);",
-    "      if (res.class_counts) {",
-    "        document.querySelectorAll('.cls-stat').forEach((el) => {",
-    "          const key = el.getAttribute('data-cls');",
-    "          if (key in res.class_counts) animateCount(el, res.class_counts[key]);",
-    "        });",
-    "      }",
-    "      const tbody = document.getElementById('historyBody');",
-    "      const emptyRow = document.getElementById('noHistoryRow');",
-    "      if (emptyRow) emptyRow.remove();",
-    "      const tr = document.createElement('tr');",
-    "      const confText = (res.entry.confidence !== null && res.entry.confidence !== undefined) ? (res.entry.confidence * 100).toFixed(2) + '%' : 'N/A';",
-    "      tr.innerHTML = '<td>' + res.entry.timestamp + '</td><td>' + res.entry.prediction + '</td><td>' + confText + '</td><td>' + res.entry.summary + '</td>';",
-    "      tbody.prepend(tr);",
-    "    }",
-    "    svmForm.addEventListener('submit', async (e) => {",
-    "      e.preventDefault();",
-    "      hideError();",
-    "      const payload = {};",
-    "      for (const feat of FEATURE_ORDER) {",
-    "        const el = (CAT_KEYS.includes(feat) && numericMode) ? document.getElementById(feat + '_num') : document.getElementById(feat);",
-    "        const raw = el ? el.value.trim() : '';",
-    "        if (raw === '' || Number.isNaN(Number(raw)) || !Number.isFinite(Number(raw))) {",
-    "          showError('Please enter a valid number or category for ' + feat + '.');",
-    "          if (el) el.focus();",
-    "          return;",
-    "        }",
-    "        payload[feat] = Number(raw);",
-    "      }",
-    "      loadingVeil.classList.add('show');",
-    "      try {",
-    "        const resp = await fetch('/predict', {",
-    "          method: 'POST',",
-    "          headers: { 'Content-Type': 'application/json' },",
-    "          body: JSON.stringify(payload),",
-    "        });",
-    "        const data = await resp.json();",
-    "        if (!resp.ok || !data.success) { showError(data.error || 'Prediction failed.'); return; }",
-    "        renderPrediction(data);",
-    "      } catch (err) {",
-    "        showError('Network error while contacting the prediction server.');",
-    "      } finally {",
-    "        loadingVeil.classList.remove('show');",
-    "      }",
-    "    });",
-    "    document.getElementById('clearHistoryBtn').addEventListener('click', async () => {",
-    "      try {",
-    "        const resp = await fetch('/clear-history', { method: 'POST' });",
-    "        const data = await resp.json();",
-    "        if (resp.ok && data.success) {",
-    "          document.getElementById('historyBody').innerHTML = '<tr id=\"noHistoryRow\"><td colspan=\"4\" style=\"text-align: center; color: var(--text-sec); padding: 18px;\">No predictions yet in this session.</td></tr>';",
-    "          animateCount(document.getElementById('totalStat'), 0);",
-    "          document.querySelectorAll('.cls-stat').forEach((el) => animateCount(el, 0));",
-    "        }",
-    "      } catch (err) { showError('Failed to clear session history.'); }",
-    "    });",
-    "    const cvs = document.getElementById('particles-canvas');",
-    "    const ctx = cvs.getContext('2d');",
-    "    let pts = [];",
-    "    function sizeCvs() { cvs.width = window.innerWidth; cvs.height = window.innerHeight; }",
-    "    function seedPts() {",
-    "      const n = Math.min(40, Math.floor((window.innerWidth * window.innerHeight) / 36000));",
-    "      pts = Array.from({ length: n }, () => ({",
-    "        x: Math.random() * cvs.width, y: Math.random() * cvs.height,",
-    "        r: Math.random() * 2.2 + 0.8, vx: (Math.random() - 0.5) * 0.3, vy: (Math.random() - 0.5) * 0.3,",
-    "      }));",
-    "    }",
-    "    function stepPts() {",
-    "      ctx.clearRect(0, 0, cvs.width, cvs.height);",
-    "      ctx.fillStyle = htmlRoot.getAttribute('data-theme') === 'light' ? 'rgba(20, 150, 137, 0.35)' : 'rgba(152, 232, 222, 0.42)';",
-    "      for (const p of pts) {",
-    "        p.x += p.vx; p.y += p.vy;",
-    "        if (p.x < 0) p.x = cvs.width; if (p.x > cvs.width) p.x = 0;",
-    "        if (p.y < 0) p.y = cvs.height; if (p.y > cvs.height) p.y = 0;",
-    "        ctx.beginPath(); ctx.arc(p.x, p.y, p.r, 0, Math.PI * 2); ctx.fill();",
-    "      }",
-    "      requestAnimationFrame(stepPts);",
-    "    }",
-    "    sizeCvs(); seedPts(); stepPts();",
-    "    window.addEventListener('resize', () => { sizeCvs(); seedPts(); });",
-    "  </script>",
-    "</body>",
-    "</html>",
-]
-
-HTML_TEMPLATE = "\n".join(HTML_LINES)
-
-
-@app.route("/", methods=["GET"])
-def index() -> str:
-    return render_template_string(
-        HTML_TEMPLATE,
-        features=FEATURE_ORDER,
-        descriptions=FEATURE_DESCRIPTIONS,
-        categorical_options=CATEGORICAL_OPTIONS,
-        cat_keys=list(CATEGORICAL_OPTIONS.keys()),
-        total_predictions=len(SESSION_HISTORY),
-        class_counts=CLASS_COUNTS,
-        history=SESSION_HISTORY,
-    )
-
-
-@app.route("/predict", methods=["POST"])
+@app.post("/predict")
 def predict():
-    try:
-        payload = request.get_json(silent=True)
-        if not isinstance(payload, dict):
-            return jsonify({"success": False, "error": "Invalid JSON payload."}), 400
+    if model is None:
+        return jsonify(error="The model file could not be loaded on the server. "
+                             "Make sure svm.pkl is in the repo root."), 503
 
-        X = build_feature_vector(payload)
-        raw_pred = MODEL.predict(X)[0]
-        pred_label = str(raw_pred)
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        return jsonify(error="Send the form values as JSON."), 400
 
-        probabilities_data = None
-        confidence = None
+    row, errors = validate(payload)
+    if errors:
+        return jsonify(error="Please fix the highlighted fields.", fields=errors), 400
 
-        if SUPPORTS_PROBA:
-            probs = MODEL.predict_proba(X)[0]
-            probabilities_data = [
-                {"class": str(c), "probability": float(p)}
-                for c, p in zip(CLASSES, probs)
-            ]
-            confidence = float(np.max(probs))
+    X = np.array([[row[n] for n in FEATURES]], dtype=float)      # exact training order
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")                           # silence feature-name notice
+        label = str(model.predict(X)[0])
 
-        CLASS_COUNTS[pred_label] = CLASS_COUNTS.get(pred_label, 0) + 1
-        timestamp = datetime.now().strftime("%H:%M:%S")
-        summary = ", ".join(f"{k}={payload[k]}" for k in FEATURE_ORDER)
+        score = None
+        if HAS_SCORE:
+            flat = np.ravel(model.decision_function(X))
+            if flat.size == 1:                                     # binary model: one signed score
+                score = round(float(flat[0]), 5)
 
-        entry = {
-            "timestamp": timestamp,
-            "prediction": pred_label,
-            "confidence": confidence,
-            "summary": summary,
-            "inputs": {k: payload[k] for k in FEATURE_ORDER},
-        }
-        SESSION_HISTORY.append(entry)
+        probabilities, confidence = None, None
+        if HAS_PROBA:                                              # only if the model supports it
+            p = model.predict_proba(X)[0]
+            probabilities = {c: round(float(v) * 100, 2) for c, v in zip(CLASSES, p)}
+            confidence = round(float(np.max(p)) * 100, 2)
 
-        return jsonify(
-            {
-                "success": True,
-                "prediction": pred_label,
-                "confidence": confidence,
-                "probabilities": probabilities_data,
-                "total_predictions": len(SESSION_HISTORY),
-                "class_counts": CLASS_COUNTS,
-                "entry": entry,
-            }
-        )
-    except ValueError as exc:
-        return jsonify({"success": False, "error": str(exc)}), 400
-    except Exception as exc:
-        return jsonify({"success": False, "error": f"Prediction error: {exc}"}), 500
+    return jsonify(prediction=label, score=score, confidence=confidence, probabilities=probabilities)
 
 
-@app.route("/clear-history", methods=["POST"])
-def clear_history():
-    SESSION_HISTORY.clear()
-    for key in CLASS_COUNTS:
-        CLASS_COUNTS[key] = 0
-    return jsonify({"success": True})
+@app.errorhandler(Exception)
+def on_error(exc):
+    """Always reply with clean JSON instead of an ugly HTML error page."""
+    if isinstance(exc, HTTPException):
+        return jsonify(error=exc.description), exc.code
+    log.exception("Unhandled error")
+    return jsonify(error="Unexpected server error. Please try again."), 500
 
 
-@app.route("/download-csv", methods=["GET"])
-def download_csv():
-    output = io.StringIO()
-    writer = csv.writer(output)
-    writer.writerow(["timestamp", "prediction", "confidence", *FEATURE_ORDER])
-    for row in SESSION_HISTORY:
-        inputs = row.get("inputs", {})
-        writer.writerow(
-            [
-                row.get("timestamp", ""),
-                row.get("prediction", ""),
-                f"{row['confidence']:.6f}" if row.get("confidence") is not None else "",
-                *[inputs.get(feat, "") for feat in FEATURE_ORDER],
-            ]
-        )
-    return Response(
-        output.getvalue(),
-        mimetype="text/csv",
-        headers={"Content-Disposition": "attachment; filename=svm_predictions.csv"},
-    )
+# ============================================================================
+# 6. THE WHOLE PAGE (HTML + CSS + JavaScript) - served by render_template_string
+#    {% raw %} blocks stop Jinja from touching the CSS/JS braces.
+# ============================================================================
+PAGE = r"""<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#101827">
+<title>{{ page_title }}</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600&family=Sora:wght@500;600;700&display=swap" rel="stylesheet">
+<script>
+  document.documentElement.classList.add("js");
+  try { document.documentElement.dataset.theme = localStorage.getItem("theme") || "dark"; } catch (e) {}
+</script>
+<style>
+{% raw %}
+/* ============================ COLOUR SYSTEM ============================ */
+:root{
+  --primary:#98E8DE;      /* Mint Turquoise */
+  --navy:#101827;         /* Deep Navy */
+  --teal:#163A40;         /* Dark Teal */
+  --aqua:#B8FFF3;         /* Soft Aqua */
+  --mint:#6FCFC1;         /* Muted Mint */
+  --white:#F5FAFA;
+  --grey:#AAB8C2;
+  --radius:26px; --ease:cubic-bezier(.2,.8,.2,1);
+}
+[data-theme="dark"]{
+  --bg1:#101827; --bg2:#163A40; --bg3:#0d2530;
+  --text:#F5FAFA; --muted:#AAB8C2; --ink:#98E8DE;
+  --glass:rgba(22,58,64,.42); --glass-hi:rgba(152,232,222,.10);
+  --border:rgba(152,232,222,.22); --input:rgba(16,24,39,.68);
+  --shadow:0 24px 70px rgba(0,0,0,.5),0 0 44px rgba(152,232,222,.07);
+  --on-primary:#101827; --shape:rgba(152,232,222,.28); --aur:.55;
+}
+[data-theme="light"]{
+  --bg1:#effaf9; --bg2:#d5f3ef; --bg3:#e6f8f5;
+  --text:#101827; --muted:#4b5f6b; --ink:#0d6f65;
+  --glass:rgba(255,255,255,.66); --glass-hi:rgba(152,232,222,.22);
+  --border:rgba(22,58,64,.16); --input:rgba(255,255,255,.92);
+  --shadow:0 20px 50px rgba(22,58,64,.14),0 0 40px rgba(111,207,193,.18);
+  --on-primary:#101827; --shape:rgba(13,111,101,.22); --aur:.45;
+}
+*{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent}
+[hidden]{display:none!important}
+html{scroll-behavior:smooth;scroll-padding-top:96px}
+body{
+  font-family:"Inter",system-ui,-apple-system,"Segoe UI",sans-serif;color:var(--text);min-height:100vh;min-height:100dvh;overflow-x:hidden;
+  background:linear-gradient(125deg,var(--bg1),var(--bg2),var(--bg3),var(--bg2),var(--bg1));background-size:420% 420%;animation:bgFlow 36s ease-in-out infinite;
+}
+@keyframes bgFlow{0%,100%{background-position:0 50%}50%{background-position:100% 50%}}
+svg.ic{width:1em;height:1em;stroke:currentColor;fill:none;stroke-width:2;stroke-linecap:round;stroke-linejoin:round;flex:none}
 
+/* ============================ BACKGROUND ============================ */
+.bg{position:fixed;inset:0;overflow:hidden;pointer-events:none;z-index:0}
+.aurora{position:absolute;width:70vmax;height:34vmax;left:-10vmax;border-radius:50%;filter:blur(70px);opacity:var(--aur);mix-blend-mode:screen;will-change:transform}
+[data-theme="light"] .aurora{mix-blend-mode:multiply}
+.au1{top:-12vmax;background:linear-gradient(90deg,rgba(152,232,222,.55),rgba(111,207,193,.0) 70%);animation:auroraA 24s ease-in-out infinite}
+.au2{top:34vh;left:auto;right:-20vmax;background:linear-gradient(90deg,rgba(22,58,64,.0),rgba(184,255,243,.38));animation:auroraB 30s ease-in-out infinite}
+.au3{bottom:-14vmax;left:10vmax;background:linear-gradient(90deg,rgba(111,207,193,.45),rgba(22,58,64,.0) 75%);animation:auroraA 34s ease-in-out infinite reverse}
+@keyframes auroraA{0%,100%{transform:translate3d(0,0,0) rotate(-6deg) scaleY(1)}50%{transform:translate3d(14vmax,5vmax,0) rotate(8deg) scaleY(1.35)}}
+@keyframes auroraB{0%,100%{transform:translate3d(0,0,0) rotate(10deg)}50%{transform:translate3d(-16vmax,-6vmax,0) rotate(-6deg) scaleY(1.3)}}
+.grid-lines{position:absolute;inset:0;opacity:.45;
+  background-image:linear-gradient(var(--border) 1px,transparent 1px),linear-gradient(90deg,var(--border) 1px,transparent 1px);background-size:70px 70px;
+  -webkit-mask-image:radial-gradient(ellipse at 50% 25%,#000 0,transparent 68%);mask-image:radial-gradient(ellipse at 50% 25%,#000 0,transparent 68%);animation:gridMove 20s linear infinite}
+@keyframes gridMove{to{background-position:70px 70px}}
+.shape{position:absolute;left:var(--x);top:var(--y);width:var(--s);height:var(--s);
+  transform:translate(calc(var(--mx,0)*var(--d)*1px),calc(var(--my,0)*var(--d)*1px));transition:transform .7s ease-out}
+.shape i{position:absolute;inset:0;display:block;animation:floaty var(--t) ease-in-out infinite;animation-delay:var(--dl,0s)}
+.shape.ring i{border:2px solid var(--shape);border-radius:50%;box-shadow:0 0 26px var(--shape),inset 0 0 26px var(--shape)}
+.shape.ring2 i{border:2px dashed var(--shape);border-radius:50%;animation:floaty var(--t) ease-in-out infinite,spin 40s linear infinite}
+.shape.hex i{background:linear-gradient(135deg,var(--shape),transparent);clip-path:polygon(25% 5%,75% 5%,100% 50%,75% 95%,25% 95%,0 50%)}
+.shape.tri i{background:linear-gradient(160deg,var(--shape),transparent);clip-path:polygon(50% 0,100% 100%,0 100%)}
+.shape.dia i{border:2px solid var(--shape);transform:rotate(45deg);animation:floatyR var(--t) ease-in-out infinite;border-radius:8px}
+.shape.orb i{border-radius:50%;background:radial-gradient(circle at 30% 30%,var(--aqua),var(--mint) 55%,transparent 72%);opacity:.38;filter:blur(1px)}
+@keyframes floaty{0%,100%{transform:translateY(0) rotate(0)}50%{transform:translateY(-34px) rotate(14deg)}}
+@keyframes floatyR{0%,100%{transform:rotate(45deg) translateY(0)}50%{transform:rotate(95deg) translateY(-30px)}}
+@keyframes spin{to{transform:rotate(360deg)}}
+#particles,#burst{position:fixed;inset:0;width:100%;height:100%;pointer-events:none}
+#particles{z-index:0}#burst{z-index:80}
+
+/* ============================ HEADER / NAV ============================ */
+.wrap{position:relative;z-index:1;max-width:1240px;margin:0 auto;padding:0 clamp(14px,3vw,28px) max(48px,env(safe-area-inset-bottom))}
+.header{position:sticky;top:12px;z-index:40;margin-top:14px;display:flex;align-items:center;gap:16px;padding:10px 12px 10px 16px;border-radius:22px;
+  background:var(--glass);border:1px solid var(--border);backdrop-filter:blur(22px) saturate(160%);-webkit-backdrop-filter:blur(22px) saturate(160%);
+  box-shadow:var(--shadow);animation:dropIn .8s var(--ease) both}
+@keyframes dropIn{from{opacity:0;transform:translateY(-24px)}to{opacity:1;transform:none}}
+.brand{display:flex;align-items:center;gap:12px;text-decoration:none;color:inherit;min-width:0}
+.logo{width:44px;height:44px;flex:none;filter:drop-shadow(0 0 12px rgba(152,232,222,.6));animation:logoFloat 5s ease-in-out infinite}
+@keyframes logoFloat{50%{transform:translateY(-3px) rotate(-4deg)}}
+.brand strong{font-family:"Sora",sans-serif;font-size:1.1rem;display:block;letter-spacing:-.01em}
+.brand small{display:block;color:var(--muted);font-size:.72rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.nav{display:flex;gap:4px;margin-left:auto;padding:4px;border-radius:16px;background:var(--glass-hi);border:1px solid var(--border)}
+.nav a{position:relative;display:flex;align-items:center;gap:8px;padding:9px 16px;border-radius:12px;color:var(--muted);text-decoration:none;font-size:.86rem;font-weight:500;transition:color .3s,background .3s,transform .3s var(--ease)}
+.nav a:hover{color:var(--text);transform:translateY(-2px);background:var(--glass-hi)}
+.nav a.active{color:var(--on-primary);background:linear-gradient(135deg,var(--primary),var(--mint));box-shadow:0 6px 20px rgba(152,232,222,.4)}
+.icon-btn{width:44px;height:44px;border-radius:14px;border:1px solid var(--border);background:var(--glass-hi);color:var(--ink);cursor:pointer;font-size:1.1rem;display:grid;place-items:center;transition:transform .5s var(--ease),box-shadow .3s}
+.icon-btn:hover{transform:rotate(30deg) scale(1.06);box-shadow:0 0 22px rgba(152,232,222,.45)}
+[data-theme=dark] .sun,[data-theme=light] .moon{display:none}
+
+/* ============================ HERO ============================ */
+.hero{text-align:center;max-width:800px;margin:clamp(34px,7vw,76px) auto clamp(30px,5vw,54px)}
+.pill{display:inline-flex;align-items:center;gap:9px;padding:8px 18px;border-radius:999px;font-size:.78rem;font-weight:500;color:var(--ink);background:var(--glass);border:1px solid var(--border);backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px)}
+.pill .dot{width:8px;height:8px;border-radius:50%;background:var(--primary);box-shadow:0 0 12px var(--primary);animation:pulse 2s infinite}
+@keyframes pulse{50%{transform:scale(1.8);opacity:.45}}
+.hero h1{font-family:"Sora",sans-serif;font-size:clamp(2.2rem,6.6vw,4rem);line-height:1.06;letter-spacing:-.03em;margin:20px 0 16px}
+.grad{background:linear-gradient(100deg,#98E8DE,#B8FFF3,#6FCFC1,#98E8DE);background-size:300% auto;-webkit-background-clip:text;background-clip:text;color:transparent;animation:shine 7s linear infinite}
+[data-theme=light] .grad{background-image:linear-gradient(100deg,#0d6f65,#13a597,#0d6f65);}
+@keyframes shine{to{background-position:300% center}}
+.hero p{color:var(--muted);font-size:clamp(.96rem,2.2vw,1.12rem);line-height:1.7;font-weight:300;max-width:640px;margin:0 auto}
+.chips{display:flex;justify-content:center;flex-wrap:wrap;gap:10px;margin-top:26px}
+.chip{display:inline-flex;align-items:center;gap:8px;padding:9px 16px;border-radius:14px;font-size:.82rem;color:var(--text);background:var(--glass);border:1px solid var(--border);transition:transform .3s var(--ease),box-shadow .3s}
+.chip svg{color:var(--ink)}
+.chip:hover{transform:translateY(-3px);box-shadow:0 10px 28px rgba(152,232,222,.28)}
+
+/* ============================ LAYOUT / CARDS ============================ */
+.main-grid{display:grid;grid-template-columns:minmax(0,1.3fr) minmax(0,1fr);gap:clamp(16px,2.4vw,28px);align-items:start}
+.side{position:sticky;top:104px}
+.section-head{display:flex;align-items:center;gap:14px;margin:clamp(40px,6vw,64px) 0 22px}
+.section-head h2{font-family:"Sora",sans-serif;font-size:clamp(1.3rem,3vw,1.7rem);letter-spacing:-.02em}
+.section-head::after{content:"";flex:1;height:1px;background:linear-gradient(90deg,var(--border),transparent)}
+.section-head svg{color:var(--ink);font-size:1.4rem}
+.card{position:relative;border-radius:var(--radius);padding:clamp(18px,2.6vw,30px);overflow:hidden;
+  background:linear-gradient(150deg,var(--glass-hi),var(--glass) 55%);border:1px solid var(--border);
+  backdrop-filter:blur(24px) saturate(150%);-webkit-backdrop-filter:blur(24px) saturate(150%);box-shadow:var(--shadow),inset 0 1px 0 rgba(255,255,255,.12);transition:transform .3s ease-out,box-shadow .4s}
+.card::before{content:"";position:absolute;inset:0;pointer-events:none;border-radius:inherit;opacity:0;transition:opacity .4s;
+  background:radial-gradient(420px circle at var(--cx,50%) var(--cy,50%),rgba(152,232,222,.16),transparent 55%)}
+.card:hover::before{opacity:1}
+.card:hover{box-shadow:var(--shadow),0 0 50px rgba(152,232,222,.14)}
+.card-head{display:flex;justify-content:space-between;align-items:center;gap:12px;margin-bottom:20px}
+.card-head h3{font-family:"Sora",sans-serif;font-size:1.08rem;font-weight:600;display:flex;align-items:center;gap:10px}
+.card-head h3 svg{color:var(--ink);font-size:1.15rem}
+.muted{color:var(--muted);font-size:.82rem}
+/* entrance animation */
+.js .reveal{opacity:0;transform:translateY(34px) scale(.98);transition:opacity .9s var(--ease),transform .9s var(--ease);transition-delay:var(--rd,0s)}
+.js .reveal.in{opacity:1;transform:none}
+
+/* ============================ FORM ============================ */
+.notice{display:flex;gap:12px;align-items:flex-start;padding:13px 15px;border-radius:16px;margin-bottom:20px;font-size:.82rem;line-height:1.55;background:rgba(152,232,222,.09);border:1px dashed var(--border)}
+.notice svg{color:var(--ink);margin-top:3px;font-size:1rem}
+.notice code{background:var(--glass-hi);padding:1px 6px;border-radius:6px;font-size:.78rem}
+.notice button{margin-left:auto;background:none;border:0;color:var(--muted);cursor:pointer;font-size:1.1rem;line-height:1}
+.progress{margin:-4px 0 22px}
+.progress-top{display:flex;justify-content:space-between;font-size:.78rem;color:var(--muted);margin-bottom:8px}
+.progress-top b{color:var(--ink)}
+.progress-bar{height:7px;border-radius:99px;background:var(--border);overflow:hidden}
+.progress-bar i{display:block;height:100%;width:0;border-radius:inherit;transition:width .7s var(--ease);background:linear-gradient(90deg,var(--mint),var(--primary),var(--aqua),var(--mint));background-size:200% 100%;animation:flow 3s linear infinite;box-shadow:0 0 14px rgba(152,232,222,.7)}
+@keyframes flow{to{background-position:200% 0}}
+.section{margin-bottom:24px}
+.section-title{display:flex;align-items:center;gap:10px;font-family:"Sora",sans-serif;font-size:.76rem;letter-spacing:.16em;text-transform:uppercase;color:var(--ink);margin-bottom:14px}
+.section-title::after{content:"";flex:1;height:1px;background:linear-gradient(90deg,var(--border),transparent)}
+.fields{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:18px 16px}
+.field.wide{grid-column:1/-1}
+.field{position:relative}
+.field label{display:flex;align-items:center;gap:8px;font-size:.86rem;font-weight:600;margin-bottom:8px;transition:color .3s}
+.field label svg{color:var(--ink);font-size:.95rem}
+.field:focus-within label{color:var(--ink)}
+.control{position:relative}
+.control input,.control select{width:100%;padding:14px 16px;border-radius:15px;font:inherit;font-size:.95rem;color:var(--text);background:var(--input);border:1px solid var(--border);outline:none;appearance:none;-webkit-appearance:none;transition:border-color .25s,box-shadow .3s,transform .3s var(--ease)}
+.control input::placeholder{color:var(--muted);opacity:.75}
+.control input::-webkit-outer-spin-button,.control input::-webkit-inner-spin-button{-webkit-appearance:none;margin:0}
+.control input[type=number]{-moz-appearance:textfield}
+.control input:hover,.control select:hover{border-color:rgba(152,232,222,.55)}
+.control input:focus,.control select:focus{border-color:var(--primary);box-shadow:0 0 0 4px rgba(152,232,222,.2),0 10px 28px rgba(152,232,222,.2);transform:translateY(-2px)}
+.control select:invalid{color:var(--muted)}
+.control select option{background:#163A40;color:#F5FAFA}
+.chev{position:absolute;right:16px;top:50%;transform:translateY(-50%);pointer-events:none;color:var(--muted);font-size:.9rem}
+.underline{position:absolute;left:14px;right:14px;bottom:0;height:2px;border-radius:2px;background:linear-gradient(90deg,var(--mint),var(--aqua));transform:scaleX(0);transition:transform .45s var(--ease);box-shadow:0 0 10px var(--primary)}
+.control:focus-within .underline{transform:scaleX(1)}
+.hint{display:block;margin-top:7px;color:var(--muted);font-size:.76rem;line-height:1.4}
+.error-text{display:none;margin-top:6px;color:#ff8a9b;font-size:.78rem;font-weight:500}
+[data-theme=light] .error-text{color:#c4264a}
+.field.invalid .control input,.field.invalid .control select{border-color:#ff8a9b;box-shadow:0 0 0 4px rgba(255,138,155,.15);animation:shake .4s}
+.field.invalid .error-text{display:block}
+@keyframes shake{20%,60%{transform:translateX(-5px)}40%,80%{transform:translateX(5px)}}
+.field.filled label::after{content:"";margin-left:auto;width:18px;height:18px;border-radius:50%;background:var(--primary) url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23101827' stroke-width='3.4' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m5 12 5 5L20 7'/%3E%3C/svg%3E") center/11px no-repeat;animation:tick .45s cubic-bezier(.3,1.6,.5,1)}
+@keyframes tick{from{transform:scale(0) rotate(-90deg)}to{transform:none}}
+
+/* ============================ BUTTONS ============================ */
+.actions{display:flex;gap:12px;margin-top:8px}
+.btn{display:inline-flex;align-items:center;justify-content:center;gap:10px;border:0;cursor:pointer;font:600 .96rem "Inter",sans-serif;padding:16px 22px;border-radius:17px;position:relative;overflow:hidden;color:var(--text);transition:transform .3s var(--ease),box-shadow .3s,background .3s}
+.btn svg{font-size:1.05rem}
+.btn.primary{flex:1;color:var(--on-primary);background:linear-gradient(110deg,var(--primary),var(--aqua),var(--mint),var(--primary));background-size:300% 100%;animation:flow 7s linear infinite;box-shadow:0 12px 32px rgba(152,232,222,.4),0 0 0 1px rgba(184,255,243,.4) inset}
+.btn.primary::after{content:"";position:absolute;top:0;left:-60%;width:40%;height:100%;transform:skewX(-20deg);background:linear-gradient(100deg,transparent,rgba(255,255,255,.65),transparent);animation:sweep 4s ease-in-out infinite}
+@keyframes sweep{0%{left:-60%}55%,100%{left:130%}}
+.btn.primary:hover{transform:translateY(-3px) scale(1.01);box-shadow:0 20px 46px rgba(152,232,222,.55)}
+.btn:active{transform:scale(.97)}
+.btn.ghost{background:var(--glass-hi);border:1px solid var(--border)}
+.btn.ghost:hover{transform:translateY(-2px);box-shadow:0 10px 26px rgba(152,232,222,.25);border-color:var(--primary)}
+.btn.small{padding:10px 14px;font-size:.8rem;border-radius:12px}
+.btn[disabled]{opacity:.7;cursor:progress}
+.ripple{position:absolute;border-radius:50%;background:rgba(255,255,255,.55);transform:scale(0);animation:ripple .65s ease-out forwards;pointer-events:none}
+@keyframes ripple{to{transform:scale(4);opacity:0}}
+
+/* ============================ RESULT ============================ */
+.result-card{border-color:rgba(152,232,222,.45);animation:glowPulse 4s ease-in-out infinite}
+@keyframes glowPulse{0%,100%{box-shadow:var(--shadow),0 0 26px rgba(152,232,222,.16)}50%{box-shadow:var(--shadow),0 0 56px rgba(152,232,222,.36)}}
+.empty{text-align:center;padding:14px 6px 4px;color:var(--muted);font-size:.9rem;line-height:1.65}
+.orb{width:94px;height:94px;margin:0 auto 18px;border-radius:50%;display:grid;place-items:center;font-size:2.2rem;color:var(--on-primary);position:relative;background:radial-gradient(circle at 30% 25%,var(--aqua),var(--mint) 70%);box-shadow:0 0 46px rgba(152,232,222,.6);animation:bob 4s ease-in-out infinite}
+.orb::before,.orb::after{content:"";position:absolute;inset:-10px;border-radius:50%;border:2px solid var(--primary);opacity:0;animation:wave 3s ease-out infinite}
+.orb::after{animation-delay:1.5s}
+@keyframes wave{0%{transform:scale(.8);opacity:.7}100%{transform:scale(1.7);opacity:0}}
+@keyframes bob{50%{transform:translateY(-9px)}}
+/* loading: radar scanner */
+.loader{text-align:center;padding:6px 0 2px}
+.radar{position:relative;width:170px;height:170px;margin:0 auto 18px;border-radius:50%}
+.radar .ring{position:absolute;border-radius:50%;border:1.5px solid var(--border)}
+.radar .r1{inset:0}.radar .r2{inset:26px}.radar .r3{inset:52px}
+.radar .sweep{position:absolute;inset:0;border-radius:50%;background:conic-gradient(from 0deg,rgba(152,232,222,.55),rgba(152,232,222,0) 28%);animation:spin 1.5s linear infinite}
+.radar .core{position:absolute;inset:74px;border-radius:50%;background:var(--primary);box-shadow:0 0 22px var(--primary);animation:pulse 1.2s ease-in-out infinite}
+.radar .blip{position:absolute;width:9px;height:9px;border-radius:50%;background:var(--aqua);box-shadow:0 0 12px var(--aqua);animation:blip 1.5s ease-in-out infinite}
+.radar .b1{left:30px;top:44px}.radar .b2{right:34px;top:96px;animation-delay:.5s}.radar .b3{left:78px;bottom:22px;animation-delay:1s}
+@keyframes blip{0%,100%{opacity:.15;transform:scale(.6)}50%{opacity:1;transform:scale(1.3)}}
+.loader p{color:var(--muted);font-weight:500;min-height:1.5em}
+.dots::after{content:"";animation:dots 1.4s steps(4) infinite}
+@keyframes dots{0%{content:""}25%{content:"."}50%{content:".."}75%,100%{content:"..."}}
+/* result content */
+.result:not([hidden]){animation:resultIn .75s cubic-bezier(.3,1.35,.5,1) both}
+@keyframes resultIn{from{opacity:0;transform:translateY(16px) scale(.92)}to{opacity:1;transform:none}}
+.cap{text-align:center;color:var(--muted);font-size:.74rem;letter-spacing:.2em;text-transform:uppercase}
+.outcome{position:relative;display:flex;align-items:center;justify-content:center;margin:16px auto 24px;width:min(78%,210px);aspect-ratio:1}
+.outcome .halo{position:absolute;inset:6%;border-radius:50%;background:radial-gradient(circle,var(--cc) 0,transparent 68%);opacity:.32;filter:blur(18px);animation:halo 3.2s ease-in-out infinite}
+@keyframes halo{50%{transform:scale(1.18);opacity:.5}}
+.outcome .ring{position:absolute;inset:0;border-radius:50%;border:2px dashed var(--cc);opacity:.55;animation:spin 26s linear infinite}
+.outcome .ring2{position:absolute;inset:12%;border-radius:50%;border:2px solid var(--cc);opacity:.35;animation:spin 18s linear infinite reverse;border-top-color:transparent}
+.outcome strong{position:relative;font-family:"Sora",sans-serif;font-size:clamp(2.6rem,9vw,3.8rem);letter-spacing:-.03em;color:var(--cc);text-shadow:0 0 28px var(--cc);text-transform:capitalize}
+.res-yes{--cc:#98E8DE}.res-no{--cc:#B8C6FF}
+[data-theme=light] .res-yes{--cc:#0d8f82}[data-theme=light] .res-no{--cc:#4a5fd0}
+.gauge{margin:6px 0 8px}
+.gauge-top{display:flex;justify-content:space-between;align-items:baseline;font-size:.8rem;color:var(--muted);margin-bottom:10px}
+.gauge-top b{font-family:"Sora",sans-serif;color:var(--text);font-size:1.05rem;font-variant-numeric:tabular-nums}
+.gauge-track{position:relative;height:12px;border-radius:99px;background:linear-gradient(90deg,rgba(184,198,255,.5),var(--border) 50%,rgba(152,232,222,.55));box-shadow:inset 0 0 12px rgba(0,0,0,.25)}
+.gauge-track::before{content:"";position:absolute;left:50%;top:-4px;bottom:-4px;width:2px;background:var(--muted);opacity:.6;border-radius:2px}
+.gauge-marker{position:absolute;top:50%;left:50%;width:24px;height:24px;margin:-12px 0 0 -12px;border-radius:50%;background:radial-gradient(circle at 30% 30%,#fff,var(--cc));box-shadow:0 0 0 4px rgba(152,232,222,.2),0 0 22px var(--cc);transition:left 1.3s cubic-bezier(.3,1.3,.5,1)}
+.gauge-ends{display:flex;justify-content:space-between;margin-top:10px;font-size:.74rem;color:var(--muted);text-transform:capitalize}
+.note{font-size:.76rem;color:var(--muted);line-height:1.55;text-align:center;margin-top:10px}
+.probs{display:grid;gap:14px;margin-top:6px}
+.prob-top{display:flex;justify-content:space-between;font-size:.85rem;margin-bottom:6px;text-transform:capitalize}
+.bar{height:10px;border-radius:99px;background:var(--border);overflow:hidden}
+.bar i{display:block;height:100%;width:0;border-radius:inherit;transition:width 1.2s var(--ease);position:relative;overflow:hidden;background:linear-gradient(90deg,var(--mint),var(--primary));box-shadow:0 0 12px rgba(152,232,222,.6)}
+.bar i::after{content:"";position:absolute;inset:0;background:linear-gradient(100deg,transparent,rgba(255,255,255,.6),transparent);transform:translateX(-100%);animation:barShine 2.4s ease-in-out infinite}
+@keyframes barShine{60%,100%{transform:translateX(100%)}}
+.summary{display:flex;flex-wrap:wrap;gap:8px;margin-top:20px;padding-top:18px;border-top:1px solid var(--border)}
+.summary span{font-size:.76rem;padding:6px 11px;border-radius:10px;background:var(--glass-hi);border:1px solid var(--border);color:var(--muted)}
+.summary b{color:var(--text);font-weight:600}
+
+/* ============================ ANALYTICS ============================ */
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:16px;margin-bottom:20px}
+.stat{padding:22px}
+.stat .ico{width:42px;height:42px;border-radius:13px;display:grid;place-items:center;font-size:1.15rem;margin-bottom:14px;color:var(--on-primary);background:linear-gradient(135deg,var(--primary),var(--mint));box-shadow:0 8px 22px rgba(152,232,222,.4)}
+.stat .num{font-family:"Sora",sans-serif;font-size:clamp(1.9rem,4vw,2.4rem);font-weight:700;letter-spacing:-.02em;font-variant-numeric:tabular-nums}
+.stat .lbl{color:var(--muted);font-size:.82rem;margin-top:2px;text-transform:capitalize}
+.analytics-grid{display:grid;grid-template-columns:minmax(0,.8fr) minmax(0,2.2fr);gap:clamp(16px,2.4vw,28px);align-items:start}
+.dist{display:grid;gap:18px}
+.dist-row .top{display:flex;justify-content:space-between;font-size:.86rem;margin-bottom:8px;text-transform:capitalize}
+.dist-row .top b{font-variant-numeric:tabular-nums}
+.dist .bar{height:12px}
+.table-wrap{overflow-x:auto;border-radius:16px;border:1px solid var(--border)}
+table{width:100%;border-collapse:collapse;font-size:.82rem;min-width:640px}
+th{text-align:left;padding:12px 12px;font-weight:600;color:var(--ink);font-size:.72rem;letter-spacing:.1em;text-transform:uppercase;background:var(--glass-hi);white-space:nowrap}
+td{padding:12px 12px;border-top:1px solid var(--border);white-space:nowrap;font-variant-numeric:tabular-nums}
+tbody tr{animation:rowIn .55s var(--ease) both;transition:background .25s}
+tbody tr:hover{background:var(--glass-hi)}
+@keyframes rowIn{from{opacity:0;transform:translateX(24px)}to{opacity:1;transform:none}}
+.tag{display:inline-block;padding:4px 12px;border-radius:99px;font-weight:600;font-size:.76rem;text-transform:capitalize;background:rgba(152,232,222,.16);color:var(--ink);border:1px solid var(--border)}
+.tag.no{background:rgba(184,198,255,.14);color:#B8C6FF}
+[data-theme=light] .tag.no{color:#4a5fd0}
+.empty-row{text-align:center;padding:30px 10px;color:var(--muted);font-size:.88rem}
+.hist-actions{display:flex;gap:10px}
+
+/* ============================ TOASTS / FOOTER ============================ */
+.toasts{position:fixed;top:max(16px,env(safe-area-inset-top));right:16px;z-index:90;display:grid;gap:10px;width:min(370px,calc(100vw - 32px))}
+.toast{position:relative;overflow:hidden;display:flex;align-items:flex-start;gap:12px;padding:15px 16px;border-radius:16px;font-size:.9rem;line-height:1.45;color:var(--text);background:var(--glass);border:1px solid var(--border);backdrop-filter:blur(22px);-webkit-backdrop-filter:blur(22px);box-shadow:var(--shadow);animation:toastIn .55s cubic-bezier(.3,1.4,.5,1) both}
+[data-theme=dark] .toast{background:rgba(16,34,44,.92)}
+[data-theme=light] .toast{background:rgba(255,255,255,.95)}
+.toast svg{margin-top:2px;font-size:1.1rem;color:var(--ink)}
+.toast.error svg{color:#ff8a9b}
+.toast::after{content:"";position:absolute;left:0;bottom:0;height:3px;width:100%;background:var(--primary);transform-origin:left;animation:life var(--ms,4s) linear forwards}
+.toast.error::after{background:#ff8a9b}
+.toast.out{animation:toastOut .35s ease forwards}
+@keyframes life{to{transform:scaleX(0)}}
+@keyframes toastIn{from{opacity:0;transform:translateX(60px) scale(.9)}to{opacity:1;transform:none}}
+@keyframes toastOut{to{opacity:0;transform:translateX(60px)}}
+footer{text-align:center;margin-top:56px;color:var(--muted);font-size:.8rem}
+footer b{color:var(--ink)}
+
+/* ============================ RESPONSIVE ============================ */
+@media (max-width:1020px){                      /* tablet */
+  .main-grid,.analytics-grid{grid-template-columns:1fr}
+  .side{position:static}
+}
+@media (max-width:760px){                       /* phone: nav becomes its own scrollable row */
+  .header{flex-wrap:wrap;gap:10px 12px}
+  .brand{flex:1}
+  .nav{order:3;width:100%;margin-left:0;overflow-x:auto;justify-content:space-between}
+  .nav a{flex:1;justify-content:center;padding:9px 10px}
+}
+@media (max-width:600px){
+  .fields{grid-template-columns:1fr}.actions{flex-direction:column}.card{border-radius:21px}
+  .brand small{display:none}.aurora{filter:blur(55px)}.grid-lines{background-size:48px 48px}
+  .shape.hex,.shape.tri{display:none}
+}
+@media (prefers-reduced-motion:reduce){*,*::before,*::after{animation-duration:.01ms!important;animation-iteration-count:1!important;transition-duration:.01ms!important}}
+{% endraw %}
+</style>
+</head>
+<body>
+{% raw %}
+<div class="bg" aria-hidden="true">
+  <div class="aurora au1"></div><div class="aurora au2"></div><div class="aurora au3"></div>
+  <div class="grid-lines"></div>
+  <div class="shape ring"  style="--x:6%;--y:16%;--s:150px;--d:14;--t:13s"><i></i></div>
+  <div class="shape ring2" style="--x:78%;--y:8%;--s:210px;--d:-18;--t:17s;--dl:-4s"><i></i></div>
+  <div class="shape hex"   style="--x:86%;--y:58%;--s:120px;--d:22;--t:15s;--dl:-2s"><i></i></div>
+  <div class="shape tri"   style="--x:10%;--y:68%;--s:100px;--d:-20;--t:12s;--dl:-6s"><i></i></div>
+  <div class="shape dia"   style="--x:48%;--y:82%;--s:70px;--d:16;--t:14s;--dl:-3s"><i></i></div>
+  <div class="shape orb"   style="--x:70%;--y:24%;--s:90px;--d:-26;--t:11s;--dl:-5s"><i></i></div>
+  <div class="shape orb"   style="--x:22%;--y:42%;--s:60px;--d:24;--t:10s;--dl:-7s"><i></i></div>
+  <div class="shape ring"  style="--x:92%;--y:86%;--s:90px;--d:-12;--t:16s;--dl:-9s"><i></i></div>
+</div>
+<canvas id="particles" aria-hidden="true"></canvas>
+<canvas id="burst" aria-hidden="true"></canvas>
+<div class="toasts" id="toasts" aria-live="polite"></div>
+{% endraw %}
+
+<div class="wrap">
+  <header class="header">
+    <a class="brand" href="#home" aria-label="{{ app_name }} home">
+      <svg class="logo" viewBox="0 0 48 48" aria-hidden="true">
+        <defs><linearGradient id="lg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#B8FFF3"/><stop offset="1" stop-color="#6FCFC1"/></linearGradient></defs>
+        <path d="M24 3 42 13.5v21L24 45 6 34.5v-21Z" fill="rgba(152,232,222,.14)" stroke="url(#lg)" stroke-width="2.4" stroke-linejoin="round"/>
+        <path d="M15 29 21 21l5 5 7-10" fill="none" stroke="url(#lg)" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+        <circle cx="33" cy="16" r="2.6" fill="#B8FFF3"/>
+      </svg>
+      <div><strong>{{ app_name }}</strong><small>{{ tagline }}</small></div>
+    </a>
+    <nav class="nav" id="nav" aria-label="Sections">
+      <a href="#home" data-target="home" class="active"><span data-i="home"></span>Home</a>
+      <a href="#predict" data-target="predict"><span data-i="sparkles"></span>Predict</a>
+      <a href="#analytics" data-target="analytics"><span data-i="chart"></span>Analytics</a>
+    </nav>
+    <button class="icon-btn" id="themeToggle" type="button" aria-label="Toggle dark / light mode"><span class="moon" data-i="moon"></span><span class="sun" data-i="sun"></span></button>
+  </header>
+
+  <main>
+    <section class="hero reveal" id="home">
+      <span class="pill"><span class="dot"></span>Instant profile-based prediction</span>
+      <h1>Know the likely outcome<br><span class="grad">for any profile</span></h1>
+      <p>Enter a person's age, gender, region, occupation and income. Our trained model returns a clear yes / no prediction in a moment, and keeps a live log of every result in your session.</p>
+      <div class="chips">
+        <span class="chip"><span data-i="target"></span><span id="chipInputs">5 inputs</span></span>
+        <span class="chip"><span data-i="check"></span>Yes / No outcome</span>
+        <span class="chip"><span data-i="bolt"></span>Instant result</span>
+        <span class="chip"><span data-i="download"></span>CSV export</span>
+      </div>
+    </section>
+
+    <section id="predict">
+      <div class="section-head reveal"><span data-i="sparkles"></span><h2>Predict</h2></div>
+      <div class="main-grid">
+        <div class="card reveal" id="formCard">
+          <div class="card-head"><h3><span data-i="sliders"></span>Profile details</h3><span class="muted" id="countLabel"></span></div>
+          <div class="notice" id="notice" hidden>
+            <span data-i="info"></span>
+            <span><b>Category names not set yet.</b> Gender, Region and Occupation show the numeric codes the model was trained with. Add your real names to <code>CATEGORY_LABELS</code> in <code>app.py</code> to show them here.</span>
+            <button type="button" id="noticeClose" aria-label="Dismiss">&times;</button>
+          </div>
+          <div class="progress"><div class="progress-top"><span>Profile completion</span><b id="progText">0%</b></div><div class="progress-bar"><i id="progBar"></i></div></div>
+          <form id="predictForm" novalidate>
+            <div id="sections"></div>
+            <div class="actions">
+              <button type="submit" class="btn primary" id="predictBtn"><span data-i="sparkles"></span><span id="predictLabel">Predict Outcome</span></button>
+              <button type="button" class="btn ghost" id="resetBtn"><span data-i="reset"></span>Reset</button>
+            </div>
+          </form>
+        </div>
+
+        <aside class="side">
+          <div class="card result-card reveal" id="resultCard" style="--rd:.12s">
+            <div class="card-head"><h3><span data-i="target"></span>Prediction result</h3></div>
+            <div class="empty" id="emptyState"><div class="orb" data-i="sparkles"></div><p>Complete the profile and press <b>Predict Outcome</b>. Your result appears here.</p></div>
+            <div class="loader" id="loader" hidden>
+              <div class="radar"><span class="ring r1"></span><span class="ring r2"></span><span class="ring r3"></span><span class="sweep"></span><span class="blip b1"></span><span class="blip b2"></span><span class="blip b3"></span><span class="core"></span></div>
+              <p><span id="loadMsg">Reading the profile</span><span class="dots"></span></p>
+            </div>
+            <div class="result" id="result" hidden>
+              <div class="cap" id="capText"></div>
+              <div class="outcome" id="outcome"><span class="halo"></span><span class="ring"></span><span class="ring2"></span><strong id="predLabel">-</strong></div>
+              <div class="gauge" id="gauge" hidden>
+                <div class="gauge-top"><span>Decision score</span><b id="scoreVal">0</b></div>
+                <div class="gauge-track"><span class="gauge-marker" id="gaugeMarker"></span></div>
+                <div class="gauge-ends"><span id="endNeg">no</span><span id="endPos">yes</span></div>
+                <p class="note" id="scoreNote">The decision score is the signed distance from the model's decision boundary. It is not a probability.</p>
+              </div>
+              <div class="probs" id="probs" hidden></div>
+              <div class="summary" id="summary"></div>
+            </div>
+          </div>
+        </aside>
+      </div>
+    </section>
+
+    <section id="analytics">
+      <div class="section-head reveal"><span data-i="chart"></span><h2>Analytics</h2></div>
+      <div class="stats" id="stats"></div>
+      <div class="analytics-grid">
+        <div class="card reveal">
+          <div class="card-head"><h3><span data-i="chart"></span>Class-wise predictions</h3></div>
+          <div class="dist" id="dist"></div>
+        </div>
+        <div class="card reveal" style="--rd:.1s">
+          <div class="card-head">
+            <div><h3><span data-i="clock"></span>Prediction history</h3><span class="muted">Predictions made during this session</span></div>
+            <div class="hist-actions">
+              <button class="btn small ghost" id="csvBtn" type="button"><span data-i="download"></span>CSV</button>
+              <button class="btn small ghost" id="clearHistory" type="button"><span data-i="trash"></span>Clear</button>
+            </div>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead><tr id="histHead"></tr></thead>
+              <tbody id="historyBody"></tbody>
+            </table>
+            <div class="empty-row" id="historyEmpty">Your prediction history will appear here.</div>
+          </div>
+        </div>
+      </div>
+    </section>
+  </main>
+  <footer>Crafted with <b>Flask</b> &amp; <b>scikit-learn</b> &middot; Hosted on Render</footer>
+</div>
+
+<script>window.__CFG__ = {{ cfg | tojson }};</script>
+<script>
+{% raw %}
+(() => {
+"use strict";
+const CFG = window.__CFG__;
+const { fields, classes, hasProba, hasScore, labelsMissing, modelOk, caption } = CFG;
+const $ = (id) => document.getElementById(id);
+const reduceMotion = matchMedia("(prefers-reduced-motion: reduce)").matches;
+const HISTORY_KEY = "profileiq_history";
+const Q = String.fromCharCode(34);
+const cap = (s) => String(s).charAt(0).toUpperCase() + String(s).slice(1);
+const POS = classes[classes.length - 1], NEG = classes[0];
+
+/* ---------------- icons (inline SVG, no external library) ---------------- */
+const P = {
+  home: '<path d="m3 10 9-7 9 7v10a2 2 0 0 1-2 2h-4v-7H9v7H5a2 2 0 0 1-2-2Z"/>',
+  sparkles: '<path d="m12 3-1.9 5.8a2 2 0 0 1-1.3 1.3L3 12l5.8 1.9a2 2 0 0 1 1.3 1.3L12 21l1.9-5.8a2 2 0 0 1 1.3-1.3L21 12l-5.8-1.9a2 2 0 0 1-1.3-1.3Z"/>',
+  chart: '<path d="M3 3v18h18"/><path d="M18 17V9M13 17V5M8 17v-3"/>',
+  moon: '<path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z"/>',
+  sun: '<circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41"/>',
+  target: '<circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="6"/><circle cx="12" cy="12" r="2"/>',
+  check: '<path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><path d="m9 11 3 3L22 4"/>',
+  bolt: '<path d="M13 2 3 14h9l-1 8 10-12h-9Z"/>',
+  download: '<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="m7 10 5 5 5-5"/><path d="M12 15V3"/>',
+  trash: '<path d="M3 6h18"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>',
+  reset: '<path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/>',
+  sliders: '<path d="M4 21v-7M4 10V3M12 21v-9M12 8V3M20 21v-5M20 12V3M1 14h6M9 8h6M17 16h6"/>',
+  info: '<circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/>',
+  alert: '<circle cx="12" cy="12" r="10"/><path d="M12 8v4M12 16h.01"/>',
+  clock: '<circle cx="12" cy="12" r="10"/><path d="M12 6v6l4 2"/>',
+  user: '<path d="M19 21v-2a4 4 0 0 0-4-4H9a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/>',
+  users: '<path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/>',
+  pin: '<path d="M20 10c0 6-8 12-8 12s-8-6-8-12a8 8 0 0 1 16 0Z"/><circle cx="12" cy="10" r="3"/>',
+  briefcase: '<rect x="2" y="7" width="20" height="14" rx="2"/><path d="M16 21V5a2 2 0 0 0-2-2h-4a2 2 0 0 0-2 2v16"/>',
+  cash: '<rect x="2" y="6" width="20" height="12" rx="2"/><circle cx="12" cy="12" r="2"/><path d="M6 12h.01M18 12h.01"/>',
+  dot: '<circle cx="12" cy="12" r="3"/>',
+  layers: '<path d="m12 2 10 5-10 5L2 7Z"/><path d="m2 17 10 5 10-5"/><path d="m2 12 10 5 10-5"/>',
+  percent: '<path d="m19 5-14 14"/><circle cx="6.5" cy="6.5" r="2.5"/><circle cx="17.5" cy="17.5" r="2.5"/>',
+  chev: '<path d="m6 9 6 6 6-6"/>',
+};
+const icon = (n) => `<svg class="ic" viewBox="0 0 24 24" aria-hidden="true">${P[n] || P.dot}</svg>`;
+document.querySelectorAll("[data-i]").forEach((el) => { el.innerHTML = icon(el.dataset.i); });
+
+/* ---------------- theme ---------------- */
+$("themeToggle").addEventListener("click", () => {
+  const next = document.documentElement.dataset.theme === "dark" ? "light" : "dark";
+  document.documentElement.dataset.theme = next;
+  try { localStorage.setItem("theme", next); } catch (e) {}
+});
+
+/* ---------------- toasts ---------------- */
+function toast(type, msg, ms = 4200) {
+  const el = document.createElement("div");
+  el.className = "toast " + type;
+  el.style.setProperty("--ms", ms + "ms");
+  el.innerHTML = icon(type === "error" ? "alert" : type === "success" ? "check" : "info") + "<span></span>";
+  el.querySelector("span").textContent = msg;
+  $("toasts").appendChild(el);
+  setTimeout(() => { el.classList.add("out"); setTimeout(() => el.remove(), 350); }, ms);
+}
+
+/* ---------------- build the form from the server config ---------------- */
+const form = $("predictForm");
+const groups = [];
+fields.forEach((f) => { if (!groups.includes(f.group)) groups.push(f.group); });
+groups.forEach((g) => {
+  const sec = document.createElement("div");
+  sec.className = "section";
+  sec.innerHTML = '<div class="section-title"><span></span></div><div class="fields"></div>';
+  sec.querySelector(".section-title span").textContent = g;
+  const box = sec.querySelector(".fields");
+  fields.filter((f) => f.group === g).forEach((f) => {
+    const d = document.createElement("div");
+    d.className = "field" + (f.wide ? " wide" : "");
+    d.dataset.name = f.name;
+    let control;
+    if (f.kind === "category") {
+      control = '<div class="control"><select id="f_' + f.name + '" name="' + f.name + '" required><option value="" selected disabled>Select&hellip;</option></select>' +
+        '<span class="chev">' + icon("chev") + '</span><i class="underline"></i></div>';
+    } else {
+      control = '<div class="control"><input id="f_' + f.name + '" name="' + f.name + '" type="number" inputmode="decimal" min="' + f.min + '" max="' + f.max +
+        '" step="' + f.step + '" required><i class="underline"></i></div>';
+    }
+    d.innerHTML = '<label for="f_' + f.name + '">' + icon(f.icon) + '<span></span></label>' + control + '<small class="hint"></small><small class="error-text"></small>';
+    d.querySelector("label span").textContent = f.label;
+    d.querySelector(".hint").textContent = f.hint;
+    if (f.kind === "category") {
+      const sel = d.querySelector("select");
+      f.options.forEach((o) => { const op = document.createElement("option"); op.value = String(o.code); op.textContent = o.label; sel.appendChild(op); });
+    } else {
+      d.querySelector("input").placeholder = f.placeholder || "Enter value";
+    }
+    box.appendChild(d);
+  });
+  $("sections").appendChild(sec);
+});
+const control = (name) => form.elements[name];
+$("countLabel").textContent = fields.length + " inputs";
+$("chipInputs").textContent = fields.length + " inputs";
+if (labelsMissing) $("notice").hidden = false;
+$("noticeClose").addEventListener("click", () => ($("notice").hidden = true));
+
+/* ---------------- completion progress ---------------- */
+function updateProgress() {
+  let done = 0;
+  fields.forEach((f) => {
+    const filled = String(control(f.name).value).trim() !== "";
+    form.querySelector('.field[data-name="' + f.name + '"]').classList.toggle("filled", filled);
+    if (filled) done++;
+  });
+  const pct = Math.round((done / fields.length) * 100);
+  $("progBar").style.width = pct + "%";
+  $("progText").textContent = done + "/" + fields.length + " \u00b7 " + pct + "%";
+}
+form.addEventListener("input", (e) => { const w = e.target.closest(".field"); if (w) w.classList.remove("invalid"); updateProgress(); });
+form.addEventListener("change", updateProgress);
+updateProgress();
+
+function setFieldError(name, msg) {
+  const w = form.querySelector('.field[data-name="' + name + '"]');
+  if (!w) return;
+  w.classList.add("invalid");
+  w.querySelector(".error-text").textContent = msg;
+}
+const clearErrors = () => form.querySelectorAll(".field.invalid").forEach((f) => f.classList.remove("invalid"));
+
+/* human-readable text of what the user entered (select shows its label) */
+function displayValue(f) {
+  const el = control(f.name);
+  return f.kind === "category" ? el.options[el.selectedIndex].textContent : el.value.trim();
+}
+
+/* ---------------- result panel ---------------- */
+const emptyState = $("emptyState"), loader = $("loader"), resultBox = $("result");
+let hasLast = false;
+function show(state) {
+  emptyState.hidden = state !== "empty";
+  loader.hidden = state !== "loading";
+  resultBox.hidden = state !== "result";
+}
+
+const MESSAGES = ["Reading the profile", "Preparing the inputs", "Running the model", "Finalising the result"];
+let msgTimer;
+
+form.addEventListener("submit", async (e) => {
+  e.preventDefault();
+  clearErrors();
+  const data = {}; let missing = 0;
+  fields.forEach((f) => {
+    data[f.name] = String(control(f.name).value).trim();
+    if (data[f.name] === "") { missing++; setFieldError(f.name, "This field is required."); }
+  });
+  if (missing) {
+    toast("error", "Please complete " + missing + " more field" + (missing > 1 ? "s" : "") + " before predicting.");
+    const bad = form.querySelector(".field.invalid");
+    if (bad) bad.scrollIntoView({ behavior: "smooth", block: "center" });
+    return;
+  }
+  const shown = {}; fields.forEach((f) => { shown[f.name] = displayValue(f); });
+
+  const btn = $("predictBtn");
+  btn.disabled = true; $("predictLabel").textContent = "Predicting\u2026";
+  show("loading");
+  let m = 0; $("loadMsg").textContent = MESSAGES[0];
+  msgTimer = setInterval(() => { m = (m + 1) % MESSAGES.length; $("loadMsg").textContent = MESSAGES[m]; }, 700);
+  if (innerWidth < 1020) $("resultCard").scrollIntoView({ behavior: "smooth", block: "center" });
+
+  try {
+    const [res] = await Promise.all([
+      fetch("/predict", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(data) }),
+      new Promise((r) => setTimeout(r, 1700)),            // keep the loading animation visible
+    ]);
+    let out = {};
+    try { out = await res.json(); } catch (_) {}
+    if (!res.ok) {
+      if (out.fields) Object.keys(out.fields).forEach((k) => setFieldError(k, out.fields[k]));
+      throw new Error(out.error || "The server returned an error (" + res.status + "). Please try again.");
+    }
+    renderResult(out, shown);
+    addHistory(shown, out);
+    toast("success", "Prediction ready: " + cap(out.prediction));
+  } catch (err) {
+    show(hasLast ? "result" : "empty");
+    toast("error", err.message || "Network problem. Please try again.", 5600);
+  } finally {
+    clearInterval(msgTimer);
+    btn.disabled = false; $("predictLabel").textContent = "Predict Outcome";
+  }
+});
+
+function renderResult(out, shown) {
+  hasLast = true;
+  show("result");
+  $("capText").textContent = caption;
+  resultBox.className = "result " + (out.prediction === POS ? "res-yes" : "res-no");
+  resultBox.style.animation = "none"; void resultBox.offsetWidth; resultBox.style.animation = "";   // replay the entrance animation for every new result
+  $("predLabel").textContent = out.prediction;
+
+  // decision score gauge - only when the model returns a score
+  const g = $("gauge");
+  g.hidden = !(hasScore && out.score !== null && out.score !== undefined);
+  if (!g.hidden) {
+    $("scoreVal").textContent = (out.score >= 0 ? "+" : "") + out.score.toFixed(4);
+    $("endNeg").textContent = NEG; $("endPos").textContent = POS;
+    const pos = 50 + 50 * Math.tanh(out.score * 4);              // visual position only; exact score shown above
+    const mk = $("gaugeMarker");
+    mk.style.left = "50%";
+    requestAnimationFrame(() => requestAnimationFrame(() => { mk.style.left = pos + "%"; }));
+  }
+
+  // probability bars - only shown if the server returned probabilities
+  const pb = $("probs");
+  pb.innerHTML = "";
+  pb.hidden = !(hasProba && out.probabilities);
+  if (!pb.hidden) {
+    classes.forEach((c) => {
+      const pct = out.probabilities[c] || 0;
+      const row = document.createElement("div");
+      row.innerHTML = '<div class="prob-top"><span></span><b></b></div><div class="bar"><i></i></div>';
+      row.querySelector("span").textContent = c;
+      row.querySelector("b").textContent = pct.toFixed(1) + "%";
+      pb.appendChild(row);
+      const bar = row.querySelector("i");
+      requestAnimationFrame(() => requestAnimationFrame(() => { bar.style.width = pct + "%"; }));
+    });
+  }
+
+  const sm = $("summary"); sm.innerHTML = "";
+  fields.forEach((f) => {
+    const s = document.createElement("span");
+    s.innerHTML = "<b></b>";
+    s.querySelector("b").textContent = f.label + ": ";
+    s.appendChild(document.createTextNode(shown[f.name]));
+    sm.appendChild(s);
+  });
+  burst();
+}
+
+/* ---------------- reset ---------------- */
+$("resetBtn").addEventListener("click", () => {
+  form.reset(); clearErrors(); updateProgress(); hasLast = false; show("empty");
+  toast("info", "All fields cleared.");
+});
+
+/* ---------------- analytics: history, counters, CSV ---------------- */
+const loadHistory = () => { try { return JSON.parse(sessionStorage.getItem(HISTORY_KEY)) || []; } catch (e) { return []; } };
+const saveHistory = (l) => { try { sessionStorage.setItem(HISTORY_KEY, JSON.stringify(l)); } catch (e) {} };
+
+// stat cards (built once, numbers animate)
+const statDefs = [{ key: "total", label: "Total predictions", ic: "layers" }]
+  .concat(classes.map((c) => ({ key: "c_" + c, label: "Predicted " + c, ic: c === POS ? "check" : "target" })))
+  .concat([{ key: "rate", label: cap(POS) + " rate", ic: "percent" }]);
+const statEls = {}, statShown = {};
+statDefs.forEach((s) => {
+  const el = document.createElement("div");
+  el.className = "card stat reveal";
+  el.innerHTML = '<div class="ico">' + icon(s.ic) + '</div><div class="num">0</div><div class="lbl"></div>';
+  el.querySelector(".lbl").textContent = s.label;
+  $("stats").appendChild(el);
+  statEls[s.key] = el.querySelector(".num"); statShown[s.key] = 0;
+});
+function tween(key, target, suffix) {
+  const el = statEls[key], from = statShown[key], t0 = performance.now(), dur = reduceMotion ? 1 : 900;
+  statShown[key] = target;
+  (function tick(now) {
+    const p = Math.min(1, (now - t0) / dur), v = from + (target - from) * (1 - Math.pow(1 - p, 3));
+    el.textContent = (suffix ? v.toFixed(1) : Math.round(v)) + (suffix || "");
+    if (p < 1) requestAnimationFrame(tick);
+  })(t0);
+}
+
+// distribution bars (built once)
+const distEls = {};
+classes.forEach((c) => {
+  const row = document.createElement("div");
+  row.className = "dist-row";
+  row.innerHTML = '<div class="top"><span></span><b>0 (0%)</b></div><div class="bar"><i></i></div>';
+  row.querySelector("span").textContent = c;
+  $("dist").appendChild(row);
+  distEls[c] = { b: row.querySelector("b"), bar: row.querySelector("i") };
+});
+
+// history table header
+const histCols = ["#", "Time"].concat(fields.map((f) => f.label), ["Prediction"], hasScore ? ["Score"] : []);
+histCols.forEach((h) => { const th = document.createElement("th"); th.textContent = h; $("histHead").appendChild(th); });
+
+function addHistory(inputs, out) {
+  const l = loadHistory();
+  l.unshift({ time: new Date().toISOString(), prediction: out.prediction, score: out.score, inputs: inputs });
+  saveHistory(l.slice(0, 100));
+  renderAnalytics();
+}
+
+function renderAnalytics() {
+  const l = loadHistory(), total = l.length, body = $("historyBody");
+  const counts = {}; classes.forEach((c) => { counts[c] = 0; });
+  l.forEach((it) => { if (counts[it.prediction] !== undefined) counts[it.prediction]++; });
+
+  tween("total", total);
+  classes.forEach((c) => {
+    tween("c_" + c, counts[c]);
+    const pct = total ? (counts[c] / total) * 100 : 0;
+    distEls[c].b.textContent = counts[c] + " (" + pct.toFixed(0) + "%)";
+    distEls[c].bar.style.width = pct + "%";
+  });
+  tween("rate", total ? (counts[POS] / total) * 100 : 0, "%");
+
+  body.innerHTML = "";
+  l.forEach((it, i) => {
+    const tr = document.createElement("tr");
+    tr.style.animationDelay = Math.min(i, 8) * 40 + "ms";
+    const cells = [String(total - i), new Date(it.time).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })]
+      .concat(fields.map((f) => it.inputs[f.name]));
+    cells.forEach((c) => { const td = document.createElement("td"); td.textContent = c; tr.appendChild(td); });
+    const tdp = document.createElement("td");
+    tdp.innerHTML = '<span class="tag"></span>';
+    const tag = tdp.firstChild; tag.textContent = it.prediction; if (it.prediction !== POS) tag.classList.add("no");
+    tr.appendChild(tdp);
+    if (hasScore) { const tds = document.createElement("td"); tds.textContent = (it.score === null || it.score === undefined) ? "-" : Number(it.score).toFixed(4); tr.appendChild(tds); }
+    body.appendChild(tr);
+  });
+  $("historyEmpty").hidden = total > 0;
+}
+
+$("clearHistory").addEventListener("click", () => {
+  if (!loadHistory().length) { toast("info", "History is already empty."); return; }
+  saveHistory([]); renderAnalytics(); toast("info", "History cleared.");
+});
+
+const csvCell = (v) => Q + String(v === null || v === undefined ? "" : v).split(Q).join(Q + Q) + Q;
+$("csvBtn").addEventListener("click", () => {
+  const l = loadHistory();
+  if (!l.length) { toast("info", "No predictions to download yet."); return; }
+  const header = ["Time", "Prediction"].concat(hasScore ? ["Decision_Score"] : [], fields.map((f) => f.name));
+  const rows = l.slice().reverse().map((it) => [it.time, it.prediction].concat(hasScore ? [it.score] : [], fields.map((f) => it.inputs[f.name])));
+  const csv = [header].concat(rows).map((r) => r.map(csvCell).join(",")).join("\r\n");
+  const url = URL.createObjectURL(new Blob(["\ufeff" + csv], { type: "text/csv;charset=utf-8;" }));
+  const a = document.createElement("a");
+  a.href = url; a.download = "prediction_history.csv";
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+  toast("success", "Prediction history downloaded.");
+});
+
+/* ---------------- effects ---------------- */
+// button ripple
+document.addEventListener("pointerdown", (e) => {
+  const b = e.target.closest(".btn"); if (!b || reduceMotion) return;
+  const r = b.getBoundingClientRect(), s = Math.max(r.width, r.height) / 2;
+  const sp = document.createElement("span"); sp.className = "ripple";
+  sp.style.cssText = "width:" + s + "px;height:" + s + "px;left:" + (e.clientX - r.left - s / 2) + "px;top:" + (e.clientY - r.top - s / 2) + "px";
+  b.appendChild(sp); setTimeout(() => sp.remove(), 700);
+});
+// cursor spotlight on cards
+document.querySelectorAll(".card").forEach((c) => {
+  c.addEventListener("pointermove", (e) => {
+    const r = c.getBoundingClientRect();
+    c.style.setProperty("--cx", (e.clientX - r.left) + "px"); c.style.setProperty("--cy", (e.clientY - r.top) + "px");
+  });
+});
+// parallax for the floating background shapes
+if (!reduceMotion) addEventListener("pointermove", (e) => {
+  const root = document.documentElement.style;
+  root.setProperty("--mx", (e.clientX / innerWidth - .5).toFixed(3));
+  root.setProperty("--my", (e.clientY / innerHeight - .5).toFixed(3));
+});
+// reveal-on-scroll (staggered card entrance)
+const revealEls = document.querySelectorAll(".reveal");
+if ("IntersectionObserver" in window) {
+  const io = new IntersectionObserver((entries) => {
+    entries.forEach((en) => { if (en.isIntersecting) { en.target.classList.add("in"); io.unobserve(en.target); } });
+  }, { threshold: .08 });
+  revealEls.forEach((el, i) => { if (!el.style.getPropertyValue("--rd")) el.style.setProperty("--rd", (i % 4) * 0.08 + "s"); io.observe(el); });
+} else { revealEls.forEach((el) => el.classList.add("in")); }
+// nav highlight follows the scroll position
+const links = document.querySelectorAll(".nav a");
+if ("IntersectionObserver" in window) {
+  const so = new IntersectionObserver((entries) => {
+    entries.forEach((en) => { if (en.isIntersecting) links.forEach((a) => a.classList.toggle("active", a.dataset.target === en.target.id)); });
+  }, { rootMargin: "-35% 0px -55% 0px" });
+  ["home", "predict", "analytics"].forEach((id) => so.observe($(id)));
+}
+
+// floating particles with soft connecting lines
+(function particles() {
+  const cv = $("particles"), ctx = cv.getContext("2d");
+  let W, H, d, P2 = [], raf, mx = -9999, my = -9999;
+  function size() {
+    d = Math.min(devicePixelRatio || 1, 2); W = cv.width = innerWidth * d; H = cv.height = innerHeight * d;
+    const n = Math.round(Math.min(70, Math.max(24, innerWidth / 20)));
+    P2 = Array.from({ length: n }, () => ({ x: Math.random() * W, y: Math.random() * H, r: (Math.random() * 1.8 + .7) * d,
+      vx: (Math.random() - .5) * .3 * d, vy: (Math.random() - .5) * .3 * d, t: Math.random() * 6.28 }));
+  }
+  addEventListener("pointermove", (e) => { mx = e.clientX * d; my = e.clientY * d; });
+  function frame() {
+    ctx.clearRect(0, 0, W, H);
+    const light = document.documentElement.dataset.theme === "light", rgb = light ? "13,111,101" : "152,232,222";
+    for (let i = 0; i < P2.length; i++) {
+      const p = P2[i];
+      const dx = p.x - mx, dy = p.y - my, dist = Math.hypot(dx, dy);
+      if (dist < 130 * d && dist > 0) { p.x += (dx / dist) * 1.2; p.y += (dy / dist) * 1.2; }
+      p.x += p.vx; p.y += p.vy; p.t += .02;
+      if (p.x < -10) p.x = W + 10; if (p.x > W + 10) p.x = -10;
+      if (p.y < -10) p.y = H + 10; if (p.y > H + 10) p.y = -10;
+      ctx.beginPath(); ctx.arc(p.x, p.y, p.r, 0, 6.2832);
+      ctx.fillStyle = "rgba(" + rgb + "," + (.25 + .45 * Math.abs(Math.sin(p.t))) + ")";
+      ctx.shadowColor = "rgba(" + rgb + ",.9)"; ctx.shadowBlur = 10 * d; ctx.fill();
+      for (let j = i + 1; j < P2.length; j++) {
+        const q = P2[j], l = Math.hypot(p.x - q.x, p.y - q.y);
+        if (l < 120 * d) { ctx.shadowBlur = 0; ctx.strokeStyle = "rgba(" + rgb + "," + (.14 * (1 - l / (120 * d))) + ")"; ctx.lineWidth = d; ctx.beginPath(); ctx.moveTo(p.x, p.y); ctx.lineTo(q.x, q.y); ctx.stroke(); }
+      }
+    }
+    raf = requestAnimationFrame(frame);
+  }
+  size(); addEventListener("resize", size);
+  document.addEventListener("visibilitychange", () => { cancelAnimationFrame(raf); if (!document.hidden && !reduceMotion) frame(); });
+  if (!reduceMotion) frame();
+})();
+
+// mint sparkle burst when a result arrives
+function burst() {
+  if (reduceMotion) return;
+  const cv = $("burst"), ctx = cv.getContext("2d"), d = Math.min(devicePixelRatio || 1, 2);
+  cv.width = innerWidth * d; cv.height = innerHeight * d;
+  const r = $("outcome").getBoundingClientRect();
+  const ox = (r.left + r.width / 2) * d, oy = (r.top + r.height / 2) * d;
+  const cols = ["#98E8DE", "#B8FFF3", "#6FCFC1", "#ffffff"];
+  const S = Array.from({ length: 64 }, () => { const a = Math.random() * 6.28, s = (Math.random() * 6 + 2) * d;
+    return { x: ox, y: oy, vx: Math.cos(a) * s, vy: Math.sin(a) * s - 2 * d, r: (Math.random() * 3 + 1.4) * d, life: 1, c: cols[Math.floor(Math.random() * cols.length)] }; });
+  (function loop() {
+    ctx.clearRect(0, 0, cv.width, cv.height);
+    let alive = false;
+    S.forEach((p) => {
+      if (p.life <= 0) return;
+      alive = true;
+      p.x += p.vx; p.y += p.vy; p.vy += .15 * d; p.vx *= .985; p.life -= .017;
+      ctx.globalAlpha = Math.max(p.life, 0); ctx.fillStyle = p.c; ctx.shadowColor = p.c; ctx.shadowBlur = 10 * d;
+      ctx.beginPath(); ctx.arc(p.x, p.y, p.r, 0, 6.2832); ctx.fill();
+    });
+    ctx.globalAlpha = 1;
+    if (alive) requestAnimationFrame(loop); else ctx.clearRect(0, 0, cv.width, cv.height);
+  })();
+}
+
+/* ---------------- start ---------------- */
+show("empty");
+renderAnalytics();
+if (!modelOk) toast("error", "The model file could not be loaded on the server. Check the Render logs.", 9000);
+})();
+{% endraw %}
+</script>
+</body>
+</html>
+"""
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+    # Render provides the port in the PORT environment variable.
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=False)
