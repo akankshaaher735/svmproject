@@ -40,7 +40,7 @@ SVM-ML-Application/
 
 ## 🌐 Live Demo
 
-🚀 **Live Application:** [Click Here to Try the Application](https://svmproject-pbsn.onrender.com/)
+🚀 **Live Application:** [Click Here to Try the Application](https://svmproject-2-c9yq.onrender.com/)
 
 
 ## 🎯 Project Objective
