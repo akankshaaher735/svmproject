@@ -54,7 +54,7 @@ OUTCOME_CAPTION = "Predicted outcome for this profile"
 # The model only understands numbers. Put the real name for each code here, the
 # same way you encoded the data before training. Example format:
 #     "Gender": {0: "Name for code 0", 1: "Name for code 1"}
-# Leave a field as {} and the dropdown simply shows "Code 0", "Code 1", ...
+# Only options that have a name here appear in the dropdown. (A field left as {} shows "Code 0", "Code 1", ...)
 #
 # To print your real mapping, run this once in your notebook
 # (df = your ORIGINAL dataframe before encoding; assumes LabelEncoder's
@@ -62,9 +62,11 @@ OUTCOME_CAPTION = "Predicted outcome for this profile"
 #     for c in ["Gender", "Region", "Occupation"]:
 #         print(c, dict(enumerate(sorted(df[c].dropna().astype(str).unique()))))
 CATEGORY_LABELS = {
-    "Gender": {0: "Female", 1: "Male"},     # alphabetical numbering (Female=0, Male=1), the usual encoder default
-    "Region": {},                            # e.g. {0: "First name", 1: "Second name"}
-    "Occupation": {},                        # e.g. {0: "...", 1: "...", 2: "...", 3: "..."}
+    "Gender":     {0: "Female", 1: "Male"},
+    "Region":     {0: "City", 1: "Countryside"},
+    # The model also knows an occupation with code 1 (alphabetically between Banker and
+    # Student) whose name is not known yet. Add it here as   1: "Name",   and it will appear.
+    "Occupation": {0: "Banker", 2: "Student", 3: "Teacher"},
 }
 CATEGORICAL_COLUMNS = ["Gender", "Region", "Occupation"]
 
@@ -129,10 +131,16 @@ def build_fields():
         meta["name"] = name
         if name in CATEGORICAL_COLUMNS:
             labels = CATEGORY_LABELS.get(name, {})
+            codes = category_codes(name)
+            if labels:                                   # show only the named options
+                hidden = [c for c in codes if c not in labels]
+                if hidden:
+                    log.warning("%s: no name given for code(s) %s, so they are hidden in the dropdown.", name, hidden)
+                codes = [c for c in codes if c in labels]
             meta["kind"] = "category"
             meta["options"] = [
                 {"code": c, "label": str(labels.get(c, f"Code {c}")), "named": c in labels}
-                for c in category_codes(name)
+                for c in codes
             ]
         else:
             meta["kind"] = "number"
