@@ -46,7 +46,11 @@ MODEL_PATH = os.path.join(BASE_DIR, "svm.pkl")
 APP_NAME = "ProfileIQ"
 APP_TAGLINE = "Smart profile-based outcome prediction"
 PAGE_TITLE = "ProfileIQ | Profile Outcome Predictor"
-OUTCOME_CAPTION = "Predicted outcome for this profile"
+OUTCOME_CAPTION = "Does this person have a laptop?"
+# What the model's two answers mean (raw class -> text shown in the app).
+OUTCOME_LABELS = {"yes": "Has a laptop", "no": "No laptop"}
+OUTCOME_SENTENCES = {"yes": "This person is predicted to HAVE a laptop.",
+                     "no": "This person is predicted NOT to have a laptop."}
 
 # ============================================================================
 # 2. CATEGORY NAMES  <-- fill these in with your real names
@@ -168,6 +172,8 @@ def index():
     cfg = {
         "appName": APP_NAME,
         "caption": OUTCOME_CAPTION,
+        "outcomeLabels": {c: OUTCOME_LABELS.get(c, c.capitalize()) for c in CLASSES},
+        "outcomeSentences": {c: OUTCOME_SENTENCES.get(c, f"Predicted: {c}") for c in CLASSES},
         "fields": FIELDS,
         "classes": CLASSES,
         "hasProba": HAS_PROBA,
@@ -498,16 +504,19 @@ svg.ic{width:1em;height:1em;stroke:currentColor;fill:none;stroke-width:2;stroke-
 .outcome strong{position:relative;font-family:"Sora",sans-serif;font-size:clamp(2.6rem,9vw,3.8rem);letter-spacing:-.03em;color:var(--cc);text-shadow:0 0 28px var(--cc);text-transform:capitalize}
 .res-yes{--cc:#98E8DE}.res-no{--cc:#B8C6FF}
 [data-theme=light] .res-yes{--cc:#0d8f82}[data-theme=light] .res-no{--cc:#4a5fd0}
+.verdict{display:flex;align-items:center;justify-content:center;gap:10px;margin:-6px 0 24px;padding:13px 16px;border-radius:16px;text-align:center;font-weight:600;font-size:.98rem;line-height:1.4;
+  background:var(--glass-hi);border:1px solid var(--cc);box-shadow:0 0 26px -8px var(--cc)}
+.verdict svg{font-size:1.25rem;color:var(--cc);flex:none}
 .gauge{margin:6px 0 8px}
 .gauge-top{display:flex;justify-content:space-between;align-items:baseline;font-size:.8rem;color:var(--muted);margin-bottom:10px}
 .gauge-top b{font-family:"Sora",sans-serif;color:var(--text);font-size:1.05rem;font-variant-numeric:tabular-nums}
 .gauge-track{position:relative;height:12px;border-radius:99px;background:linear-gradient(90deg,rgba(184,198,255,.5),var(--border) 50%,rgba(152,232,222,.55));box-shadow:inset 0 0 12px rgba(0,0,0,.25)}
 .gauge-track::before{content:"";position:absolute;left:50%;top:-4px;bottom:-4px;width:2px;background:var(--muted);opacity:.6;border-radius:2px}
 .gauge-marker{position:absolute;top:50%;left:50%;width:24px;height:24px;margin:-12px 0 0 -12px;border-radius:50%;background:radial-gradient(circle at 30% 30%,#fff,var(--cc));box-shadow:0 0 0 4px rgba(152,232,222,.2),0 0 22px var(--cc);transition:left 1.3s cubic-bezier(.3,1.3,.5,1)}
-.gauge-ends{display:flex;justify-content:space-between;margin-top:10px;font-size:.74rem;color:var(--muted);text-transform:capitalize}
+.gauge-ends{display:flex;justify-content:space-between;margin-top:10px;font-size:.74rem;color:var(--muted)}
 .note{font-size:.76rem;color:var(--muted);line-height:1.55;text-align:center;margin-top:10px}
 .probs{display:grid;gap:14px;margin-top:6px}
-.prob-top{display:flex;justify-content:space-between;font-size:.85rem;margin-bottom:6px;text-transform:capitalize}
+.prob-top{display:flex;justify-content:space-between;font-size:.85rem;margin-bottom:6px}
 .bar{height:10px;border-radius:99px;background:var(--border);overflow:hidden}
 .bar i{display:block;height:100%;width:0;border-radius:inherit;transition:width 1.2s var(--ease);position:relative;overflow:hidden;background:linear-gradient(90deg,var(--mint),var(--primary));box-shadow:0 0 12px rgba(152,232,222,.6)}
 .bar i::after{content:"";position:absolute;inset:0;background:linear-gradient(100deg,transparent,rgba(255,255,255,.6),transparent);transform:translateX(-100%);animation:barShine 2.4s ease-in-out infinite}
@@ -521,10 +530,10 @@ svg.ic{width:1em;height:1em;stroke:currentColor;fill:none;stroke-width:2;stroke-
 .stat{padding:22px}
 .stat .ico{width:42px;height:42px;border-radius:13px;display:grid;place-items:center;font-size:1.15rem;margin-bottom:14px;color:var(--on-primary);background:linear-gradient(135deg,var(--primary),var(--mint));box-shadow:0 8px 22px rgba(152,232,222,.4)}
 .stat .num{font-family:"Sora",sans-serif;font-size:clamp(1.9rem,4vw,2.4rem);font-weight:700;letter-spacing:-.02em;font-variant-numeric:tabular-nums}
-.stat .lbl{color:var(--muted);font-size:.82rem;margin-top:2px;text-transform:capitalize}
+.stat .lbl{color:var(--muted);font-size:.82rem;margin-top:2px}
 .analytics-grid{display:grid;grid-template-columns:minmax(0,.8fr) minmax(0,2.2fr);gap:clamp(16px,2.4vw,28px);align-items:start}
 .dist{display:grid;gap:18px}
-.dist-row .top{display:flex;justify-content:space-between;font-size:.86rem;margin-bottom:8px;text-transform:capitalize}
+.dist-row .top{display:flex;justify-content:space-between;font-size:.86rem;margin-bottom:8px}
 .dist-row .top b{font-variant-numeric:tabular-nums}
 .dist .bar{height:12px}
 .table-wrap{overflow-x:auto;border-radius:16px;border:1px solid var(--border)}
@@ -534,7 +543,7 @@ td{padding:12px 12px;border-top:1px solid var(--border);white-space:nowrap;font-
 tbody tr{animation:rowIn .55s var(--ease) both;transition:background .25s}
 tbody tr:hover{background:var(--glass-hi)}
 @keyframes rowIn{from{opacity:0;transform:translateX(24px)}to{opacity:1;transform:none}}
-.tag{display:inline-block;padding:4px 12px;border-radius:99px;font-weight:600;font-size:.76rem;text-transform:capitalize;background:rgba(152,232,222,.16);color:var(--ink);border:1px solid var(--border)}
+.tag{display:inline-block;padding:4px 12px;border-radius:99px;font-weight:600;font-size:.76rem;background:rgba(152,232,222,.16);color:var(--ink);border:1px solid var(--border)}
 .tag.no{background:rgba(184,198,255,.14);color:#B8C6FF}
 [data-theme=light] .tag.no{color:#4a5fd0}
 .empty-row{text-align:center;padding:30px 10px;color:var(--muted);font-size:.88rem}
@@ -621,7 +630,7 @@ footer b{color:var(--ink)}
       <p>Enter a person's age, gender, region, occupation and income. Our trained model returns a clear yes / no prediction in a moment, and keeps a live log of every result in your session.</p>
       <div class="chips">
         <span class="chip"><span data-i="target"></span><span id="chipInputs">5 inputs</span></span>
-        <span class="chip"><span data-i="check"></span>Yes / No outcome</span>
+        <span class="chip"><span data-i="check"></span>Laptop: yes / no</span>
         <span class="chip"><span data-i="bolt"></span>Instant result</span>
         <span class="chip"><span data-i="download"></span>CSV export</span>
       </div>
@@ -658,6 +667,7 @@ footer b{color:var(--ink)}
             <div class="result" id="result" hidden>
               <div class="cap" id="capText"></div>
               <div class="outcome" id="outcome"><span class="halo"></span><span class="ring"></span><span class="ring2"></span><strong id="predLabel">-</strong></div>
+              <div class="verdict" id="verdict"><span id="verdictIcon"></span><span id="verdictText"></span></div>
               <div class="gauge" id="gauge" hidden>
                 <div class="gauge-top"><span>Decision score</span><b id="scoreVal">0</b></div>
                 <div class="gauge-track"><span class="gauge-marker" id="gaugeMarker"></span></div>
@@ -708,13 +718,14 @@ footer b{color:var(--ink)}
 (() => {
 "use strict";
 const CFG = window.__CFG__;
-const { fields, classes, hasProba, hasScore, labelsMissing, modelOk, caption } = CFG;
+const { fields, classes, hasProba, hasScore, labelsMissing, modelOk, caption, outcomeLabels, outcomeSentences } = CFG;
 const $ = (id) => document.getElementById(id);
 const reduceMotion = matchMedia("(prefers-reduced-motion: reduce)").matches;
 const HISTORY_KEY = "profileiq_history";
 const Q = String.fromCharCode(34);
 const cap = (s) => String(s).charAt(0).toUpperCase() + String(s).slice(1);
 const POS = classes[classes.length - 1], NEG = classes[0];
+const lab = (c) => outcomeLabels[c] || cap(c);          // friendly text for a class
 
 /* ---------------- icons (inline SVG, no external library) ---------------- */
 const P = {
@@ -739,6 +750,8 @@ const P = {
   briefcase: '<rect x="2" y="7" width="20" height="14" rx="2"/><path d="M16 21V5a2 2 0 0 0-2-2h-4a2 2 0 0 0-2 2v16"/>',
   cash: '<rect x="2" y="6" width="20" height="12" rx="2"/><circle cx="12" cy="12" r="2"/><path d="M6 12h.01M18 12h.01"/>',
   dot: '<circle cx="12" cy="12" r="3"/>',
+  laptop: '<rect x="3" y="4" width="18" height="12" rx="2"/><path d="M2 20h20"/>',
+  x: '<path d="M18 6 6 18M6 6l12 12"/>',
   layers: '<path d="m12 2 10 5-10 5L2 7Z"/><path d="m2 17 10 5 10-5"/><path d="m2 12 10 5 10-5"/>',
   percent: '<path d="m19 5-14 14"/><circle cx="6.5" cy="6.5" r="2.5"/><circle cx="17.5" cy="17.5" r="2.5"/>',
   chev: '<path d="m6 9 6 6 6-6"/>',
@@ -886,7 +899,7 @@ form.addEventListener("submit", async (e) => {
     }
     renderResult(out, shown);
     addHistory(shown, out);
-    toast("success", "Prediction ready: " + cap(out.prediction));
+    toast("success", lab(out.prediction));
   } catch (err) {
     show(hasLast ? "result" : "empty");
     toast("error", err.message || "Network problem. Please try again.", 5600);
@@ -903,13 +916,15 @@ function renderResult(out, shown) {
   resultBox.className = "result " + (out.prediction === POS ? "res-yes" : "res-no");
   resultBox.style.animation = "none"; void resultBox.offsetWidth; resultBox.style.animation = "";   // replay the entrance animation for every new result
   $("predLabel").textContent = out.prediction;
+  $("verdictIcon").innerHTML = icon(out.prediction === POS ? "laptop" : "x");
+  $("verdictText").textContent = outcomeSentences[out.prediction] || ("Predicted: " + lab(out.prediction));
 
   // decision score gauge - only when the model returns a score
   const g = $("gauge");
   g.hidden = !(hasScore && out.score !== null && out.score !== undefined);
   if (!g.hidden) {
     $("scoreVal").textContent = (out.score >= 0 ? "+" : "") + out.score.toFixed(4);
-    $("endNeg").textContent = NEG; $("endPos").textContent = POS;
+    $("endNeg").textContent = lab(NEG); $("endPos").textContent = lab(POS);
     const pos = 50 + 50 * Math.tanh(out.score * 4);              // visual position only; exact score shown above
     const mk = $("gaugeMarker");
     mk.style.left = "50%";
@@ -925,7 +940,7 @@ function renderResult(out, shown) {
       const pct = out.probabilities[c] || 0;
       const row = document.createElement("div");
       row.innerHTML = '<div class="prob-top"><span></span><b></b></div><div class="bar"><i></i></div>';
-      row.querySelector("span").textContent = c;
+      row.querySelector("span").textContent = lab(c);
       row.querySelector("b").textContent = pct.toFixed(1) + "%";
       pb.appendChild(row);
       const bar = row.querySelector("i");
@@ -956,8 +971,8 @@ const saveHistory = (l) => { try { sessionStorage.setItem(HISTORY_KEY, JSON.stri
 
 // stat cards (built once, numbers animate)
 const statDefs = [{ key: "total", label: "Total predictions", ic: "layers" }]
-  .concat(classes.map((c) => ({ key: "c_" + c, label: "Predicted " + c, ic: c === POS ? "check" : "target" })))
-  .concat([{ key: "rate", label: cap(POS) + " rate", ic: "percent" }]);
+  .concat(classes.map((c) => ({ key: "c_" + c, label: lab(c), ic: c === POS ? "check" : "target" })))
+  .concat([{ key: "rate", label: lab(POS) + " (%)", ic: "percent" }]);
 const statEls = {}, statShown = {};
 statDefs.forEach((s) => {
   const el = document.createElement("div");
@@ -983,7 +998,7 @@ classes.forEach((c) => {
   const row = document.createElement("div");
   row.className = "dist-row";
   row.innerHTML = '<div class="top"><span></span><b>0 (0%)</b></div><div class="bar"><i></i></div>';
-  row.querySelector("span").textContent = c;
+  row.querySelector("span").textContent = lab(c);
   $("dist").appendChild(row);
   distEls[c] = { b: row.querySelector("b"), bar: row.querySelector("i") };
 });
@@ -1022,7 +1037,7 @@ function renderAnalytics() {
     cells.forEach((c) => { const td = document.createElement("td"); td.textContent = c; tr.appendChild(td); });
     const tdp = document.createElement("td");
     tdp.innerHTML = '<span class="tag"></span>';
-    const tag = tdp.firstChild; tag.textContent = it.prediction; if (it.prediction !== POS) tag.classList.add("no");
+    const tag = tdp.firstChild; tag.textContent = lab(it.prediction); if (it.prediction !== POS) tag.classList.add("no");
     tr.appendChild(tdp);
     if (hasScore) { const tds = document.createElement("td"); tds.textContent = (it.score === null || it.score === undefined) ? "-" : Number(it.score).toFixed(4); tr.appendChild(tds); }
     body.appendChild(tr);
